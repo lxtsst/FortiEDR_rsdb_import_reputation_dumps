@@ -107,19 +107,32 @@ state_has_file() {
 
 completed_in_cli_log() {
   local base="$1"
-  local log_file
+  local log_file type date part
 
-  for log_file in "$CLI_LOG" "$CLI_LOG".*; do
+  if [[ "$base" =~ ^reputation-(full|week|day)-([0-9]{4}-[0-9]{2}-[0-9]{2})-part_part_([0-9]+)\.zip$ ]]; then
+    type="${BASH_REMATCH[1]}"
+    date="${BASH_REMATCH[2]}"
+    part="${BASH_REMATCH[3]}"
+  else
+    return 1
+  fi
+
+  # Successful imports write metadata near the end of the operation. Matching
+  # metadata is more reliable than matching the initial "Validating..." line,
+  # because multi-hour full imports can rotate CLI logs between start and finish.
+  # FortiEDR rotates CLI logs as reputationdb-<timestamp>.log.gz, not only
+  # reputationdb.log.*. Scan both forms so old successful full parts are found.
+  for log_file in "$CLI_LOG" /var/log/reputationdb/cli/reputationdb*.log*; do
     [[ -e "$log_file" ]] || continue
     if [[ "$log_file" == *.gz ]]; then
       zcat -- "$log_file" 2>/dev/null
     else
       cat -- "$log_file" 2>/dev/null
-    fi | awk -v file="$base" '
-      index($0, "Validating outer zip file content:") {
-        in_target = (index($0, file) > 0)
-      }
-      in_target && index($0, "Load dump successfully") {
+    fi | awk -v type="$type" -v date="$date" -v part="$part" '
+      index($0, "Saving metadata Dump metadata.") &&
+      index($0, "type: " type) &&
+      index($0, "to:" date) &&
+      index($0, "partNum: " part " ") {
         found=1
       }
       END { exit found ? 0 : 1 }
