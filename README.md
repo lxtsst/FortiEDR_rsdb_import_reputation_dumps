@@ -1,5 +1,7 @@
 #FortiEDR RSDB Reputation Dump 自动导入脚本使用说明
 
+中文 | [English](README.en.md)
+
 ## 脚本位置
 
 RSDB 服务器上的脚本路径：
