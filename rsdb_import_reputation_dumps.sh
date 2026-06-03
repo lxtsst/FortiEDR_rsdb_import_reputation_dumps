@@ -16,6 +16,10 @@ MIN_ROOT_AVAIL_BYTES=$((10 * ONE_GIB))
 MIN_DB_AVAIL_BYTES=$((20 * ONE_GIB))
 MODE="run"
 ONLY_TYPE="all"
+LATEST_META_RANK=""
+LATEST_META_DATE=""
+LATEST_META_PART=""
+LATEST_META_TYPE=""
 
 usage() {
   cat <<'USAGE'
@@ -80,6 +84,59 @@ rank_for_type() {
   esac
 }
 
+parse_dump_basename() {
+  local base="$1"
+  if [[ "$base" =~ ^reputation-(full|week|day)-([0-9]{4}-[0-9]{2}-[0-9]{2})-part_part_([0-9]+)\.zip$ ]]; then
+    printf "%s|%s|%s\n" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    return 0
+  fi
+  return 1
+}
+
+load_latest_metadata_cursor() {
+  local out type date part
+
+  # last-dump-metadata can hit a RocksDB LOCK when invoked from /tmp or through
+  # some pipelines on this RSDB build. Keep metadata reads out of the dump
+  # working directory and avoid piping reputationdb directly.
+  out="$(cd / && reputationdb last-dump-metadata 2>&1 || true)"
+  out="${out//$'\n'/ }"
+  if [[ "$out" =~ type:[[:space:]]*(full|week|day)[[:space:]]+from:.*to:([0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+partNum:[[:space:]]*([0-9]+) ]]; then
+    type="${BASH_REMATCH[1]}"
+    date="${BASH_REMATCH[2]}"
+    part="${BASH_REMATCH[3]}"
+    LATEST_META_TYPE="$type"
+    LATEST_META_DATE="$date"
+    LATEST_META_PART="$part"
+    LATEST_META_RANK="$(rank_for_type "$type")"
+    log "Latest DB metadata cursor: $type $date part $part"
+  fi
+}
+
+covered_by_latest_metadata() {
+  local base="$1"
+  local parsed type date part rank
+
+  [[ -n "$LATEST_META_RANK" ]] || return 1
+  parsed="$(parse_dump_basename "$base")" || return 1
+  IFS='|' read -r type date part <<< "$parsed"
+  rank="$(rank_for_type "$type")"
+
+  if (( rank < LATEST_META_RANK )); then
+    return 0
+  fi
+  if (( rank > LATEST_META_RANK )); then
+    return 1
+  fi
+  if [[ "$date" < "$LATEST_META_DATE" ]]; then
+    return 0
+  fi
+  if [[ "$date" > "$LATEST_META_DATE" ]]; then
+    return 1
+  fi
+  (( part <= LATEST_META_PART ))
+}
+
 state_has_basename() {
   local base="$1"
   [[ -f "$STATE_FILE" ]] || return 1
@@ -107,15 +164,10 @@ state_has_file() {
 
 completed_in_cli_log() {
   local base="$1"
-  local log_file type date part
+  local log_file parsed type date part
 
-  if [[ "$base" =~ ^reputation-(full|week|day)-([0-9]{4}-[0-9]{2}-[0-9]{2})-part_part_([0-9]+)\.zip$ ]]; then
-    type="${BASH_REMATCH[1]}"
-    date="${BASH_REMATCH[2]}"
-    part="${BASH_REMATCH[3]}"
-  else
-    return 1
-  fi
+  parsed="$(parse_dump_basename "$base")" || return 1
+  IFS='|' read -r type date part <<< "$parsed"
 
   # Successful imports write metadata near the end of the operation. Matching
   # metadata is more reliable than matching the initial "Validating..." line,
@@ -144,7 +196,7 @@ completed_in_cli_log() {
 
 is_imported() {
   local base="$1"
-  state_has_basename "$base" || completed_in_cli_log "$base"
+  state_has_basename "$base" || covered_by_latest_metadata "$base" || completed_in_cli_log "$base"
 }
 
 record_imported() {
@@ -361,6 +413,12 @@ import_one() {
     log "State has $base but file size changed; continuing with import attempt."
   fi
 
+  if covered_by_latest_metadata "$base"; then
+    log "SKIP already covered by latest DB metadata: $base"
+    record_imported "$path"
+    return 0
+  fi
+
   if completed_in_cli_log "$base"; then
     log "SKIP already imported from CLI log: $base"
     record_imported "$path"
@@ -422,6 +480,7 @@ main() {
 
   assert_no_load_running
   warn_reputationdb_server_running
+  load_latest_metadata_cursor
   ensure_workdir
   check_filesystem_space
   trap cleanup_workdir_temp EXIT
