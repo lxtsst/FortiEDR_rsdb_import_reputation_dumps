@@ -1,4 +1,4 @@
-# RSDB Reputation Dump 自动导入脚本使用说明
+#FortiEDR RSDB Reputation Dump 自动导入脚本使用说明
 
 ## 脚本位置
 
