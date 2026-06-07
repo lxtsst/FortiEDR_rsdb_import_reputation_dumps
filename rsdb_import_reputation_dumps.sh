@@ -16,6 +16,11 @@ MIN_ROOT_AVAIL_BYTES=$((10 * ONE_GIB))
 MIN_DB_AVAIL_BYTES=$((20 * ONE_GIB))
 MODE="run"
 ONLY_TYPE="all"
+LATEST_META_RANK=""
+LATEST_META_DATE=""
+LATEST_META_FROM_DATE=""
+LATEST_META_PART=""
+LATEST_META_TYPE=""
 
 usage() {
   cat <<'USAGE'
@@ -28,7 +33,7 @@ Behavior:
   - Skips files already recorded in state or already completed in reputationdb CLI logs.
   - Uses /tmp/rsdb_ramwork tmpfs as the working directory for large full parts.
   - Records successful imports in /var/lib/reputationdb/import_state/imported_dumps.tsv.
-  - New records include sha256. Older records without sha256 are still accepted.
+  - New records use file name and size only to avoid hashing multi-GB dump files.
   - Deletes imported reputation dump files in /tmp when they are older than 15 days.
   - If RocksDB is rebuilt, cleared, or restored from backup, review or clear
     /var/lib/reputationdb/import_state/imported_dumps.tsv first. Otherwise old
@@ -80,6 +85,74 @@ rank_for_type() {
   esac
 }
 
+parse_dump_basename() {
+  local base="$1"
+  if [[ "$base" =~ ^reputation-(full|week|day)-([0-9]{4}-[0-9]{2}-[0-9]{2})-part_part_([0-9]+)\.zip$ ]]; then
+    printf "%s|%s|%s\n" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    return 0
+  fi
+  return 1
+}
+
+load_latest_metadata_cursor() {
+  local out type date part from_date
+
+  # last-dump-metadata can hit a RocksDB LOCK when invoked from /tmp or through
+  # some pipelines on this RSDB build. Keep metadata reads out of the dump
+  # working directory and avoid piping reputationdb directly.
+  out="$(cd / && reputationdb last-dump-metadata 2>&1 || true)"
+  out="${out//$'\n'/ }"
+  from_date=""
+  if [[ "$out" =~ from:[[:space:]]*([0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2} ]]; then
+    from_date="${BASH_REMATCH[1]}"
+  fi
+  if [[ "$out" =~ type:[[:space:]]*(full|week|day)[[:space:]]+from:.*to:([0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+partNum:[[:space:]]*([0-9]+) ]]; then
+    type="${BASH_REMATCH[1]}"
+    date="${BASH_REMATCH[2]}"
+    part="${BASH_REMATCH[3]}"
+    LATEST_META_TYPE="$type"
+    LATEST_META_DATE="$date"
+    LATEST_META_FROM_DATE="$from_date"
+    LATEST_META_PART="$part"
+    LATEST_META_RANK="$(rank_for_type "$type")"
+    if [[ -n "$from_date" ]]; then
+      log "Latest DB metadata cursor: $type $from_date to $date part $part"
+    else
+      log "Latest DB metadata cursor: $type $date part $part"
+    fi
+  fi
+}
+
+covered_by_latest_metadata() {
+  local base="$1"
+  local parsed type date part rank
+
+  [[ -n "$LATEST_META_RANK" ]] || return 1
+  parsed="$(parse_dump_basename "$base")" || return 1
+  IFS='|' read -r type date part <<< "$parsed"
+  rank="$(rank_for_type "$type")"
+
+  if [[ "$LATEST_META_TYPE" == "week" && "$type" == "day" && -n "$LATEST_META_FROM_DATE" ]]; then
+    if [[ ( "$date" == "$LATEST_META_FROM_DATE" || "$date" > "$LATEST_META_FROM_DATE" ) && ( "$date" == "$LATEST_META_DATE" || "$date" < "$LATEST_META_DATE" ) ]]; then
+      return 0
+    fi
+  fi
+
+  if (( rank < LATEST_META_RANK )); then
+    return 0
+  fi
+  if (( rank > LATEST_META_RANK )); then
+    return 1
+  fi
+  if [[ "$date" < "$LATEST_META_DATE" ]]; then
+    return 0
+  fi
+  if [[ "$date" > "$LATEST_META_DATE" ]]; then
+    return 1
+  fi
+  (( part <= LATEST_META_PART ))
+}
+
 state_has_basename() {
   local base="$1"
   [[ -f "$STATE_FILE" ]] || return 1
@@ -107,19 +180,27 @@ state_has_file() {
 
 completed_in_cli_log() {
   local base="$1"
-  local log_file
+  local log_file parsed type date part
 
-  for log_file in "$CLI_LOG" "$CLI_LOG".*; do
+  parsed="$(parse_dump_basename "$base")" || return 1
+  IFS='|' read -r type date part <<< "$parsed"
+
+  # Successful imports write metadata near the end of the operation. Matching
+  # metadata is more reliable than matching the initial "Validating..." line,
+  # because multi-hour full imports can rotate CLI logs between start and finish.
+  # FortiEDR rotates CLI logs as reputationdb-<timestamp>.log.gz, not only
+  # reputationdb.log.*. Scan both forms so old successful full parts are found.
+  for log_file in "$CLI_LOG" /var/log/reputationdb/cli/reputationdb*.log*; do
     [[ -e "$log_file" ]] || continue
     if [[ "$log_file" == *.gz ]]; then
       zcat -- "$log_file" 2>/dev/null
     else
       cat -- "$log_file" 2>/dev/null
-    fi | awk -v file="$base" '
-      index($0, "Validating outer zip file content:") {
-        in_target = (index($0, file) > 0)
-      }
-      in_target && index($0, "Load dump successfully") {
+    fi | awk -v type="$type" -v date="$date" -v part="$part" '
+      index($0, "Saving metadata Dump metadata.") &&
+      index($0, "type: " type) &&
+      index($0, "to:" date) &&
+      index($0, "partNum: " part " ") {
         found=1
       }
       END { exit found ? 0 : 1 }
@@ -129,14 +210,19 @@ completed_in_cli_log() {
   return 1
 }
 
+part_log_already_loaded() {
+  local part_log="$1"
+  grep -qi "dump data was already loaded" "$part_log"
+}
+
 is_imported() {
   local base="$1"
-  state_has_basename "$base" || completed_in_cli_log "$base"
+  state_has_basename "$base" || covered_by_latest_metadata "$base" || completed_in_cli_log "$base"
 }
 
 record_imported() {
   local path="$1"
-  local base size sha256 rc
+  local base size rc
   base="$(basename "$path")"
   size="$(stat -c '%s' "$path")"
 
@@ -146,9 +232,8 @@ record_imported() {
   set -e
 
   if [[ "$rc" -ne 0 ]]; then
-    log "Calculating sha256 for imported dump state: $base"
-    sha256="$(sha256sum "$path" | awk '{print $1}')"
-    printf "%s\t%s\t%s\t%s\t%s\n" "$(date '+%F %T %Z')" "$base" "$size" "$sha256" "$path" >> "$STATE_FILE"
+    log "Recording imported dump state by file name and size: $base"
+    printf "%s\t%s\t%s\t%s\t%s\n" "$(date '+%F %T %Z')" "$base" "$size" "name_size_only" "$path" >> "$STATE_FILE"
   fi
 }
 
@@ -348,9 +433,13 @@ import_one() {
     log "State has $base but file size changed; continuing with import attempt."
   fi
 
+  if covered_by_latest_metadata "$base"; then
+    log "SKIP already covered by latest DB metadata: $base"
+    return 0
+  fi
+
   if completed_in_cli_log "$base"; then
     log "SKIP already imported from CLI log: $base"
-    record_imported "$path"
     return 0
   fi
 
@@ -373,6 +462,12 @@ import_one() {
   set -e
 
   if [[ "$rc" -ne 0 ]]; then
+    if part_log_already_loaded "$part_log"; then
+      log "SKIP already loaded according to reputationdb metadata validation: $base"
+      record_imported "$path"
+      cleanup_workdir_temp
+      return 0
+    fi
     log "FAILED import: $base exit=$rc"
     if grep -qiE "Signature verification failed|verification timed out" "$part_log"; then
       log "Signature verification failed or timed out for $base. Temporary files will be cleaned; retry may succeed."
@@ -383,6 +478,12 @@ import_one() {
   fi
 
   if ! grep -q "Load dump successfully" "$part_log" && ! completed_in_cli_log "$base"; then
+    if part_log_already_loaded "$part_log"; then
+      log "SKIP already loaded according to reputationdb metadata validation: $base"
+      record_imported "$path"
+      cleanup_workdir_temp
+      return 0
+    fi
     log "FAILED verification: command exited 0 but success marker was not found for $base"
     if grep -qiE "Signature verification failed|verification timed out" "$part_log"; then
       log "Signature verification failed or timed out for $base. Temporary files will be cleaned; retry may succeed."
@@ -409,6 +510,7 @@ main() {
 
   assert_no_load_running
   warn_reputationdb_server_running
+  load_latest_metadata_cursor
   ensure_workdir
   check_filesystem_space
   trap cleanup_workdir_temp EXIT

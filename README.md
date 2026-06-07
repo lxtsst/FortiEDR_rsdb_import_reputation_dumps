@@ -1,4 +1,4 @@
-#FortiEDR RSDB Reputation Dump 自动导入脚本使用说明
+# FortiEDR RSDB Reputation Dump 自动导入脚本使用说明
 
 中文 | [English](README.en.md)
 
@@ -23,8 +23,11 @@ RSDB 服务器上的脚本路径：
 - 使用 `/tmp/rsdb_ramwork` 作为 `tmpfs` 内存工作目录，避免大 full 包签名校验超时。
 - 防止重复导入，判断依据包括：
   - `/var/lib/reputationdb/import_state/imported_dumps.tsv`
-  - `/var/log/reputationdb/cli/reputationdb.log*`
-- 成功导入后记录文件名、大小、sha256、路径和时间。
+  - `reputationdb last-dump-metadata`
+  - `/var/log/reputationdb/cli/reputationdb*.log*`
+- 支持根据最新 DB metadata 判断覆盖关系，例如 week 包已经覆盖的 day 包会自动跳过。
+- 如果 `reputationdb` 返回 `dump data was already loaded`，脚本会按已加载处理并继续后续文件。
+- 成功导入后记录文件名、大小、路径和时间；不再对多 GB dump 文件计算 sha256。
 - 自动清理 `/tmp` 下超过 15 天且已确认导入成功的 dump zip 文件。
 - 如果已有 `reputationdb load-dump` 进程在运行，脚本会退出，避免并发导入。
 
@@ -62,6 +65,7 @@ ps -eo pid,etime,pcpu,pmem,args | grep "reputationdb load-dump" | grep -v grep |
 
 - full、week、day 的导入顺序是否正确；
 - 已导入的文件是否显示为 `SKIP`；
+- 已被最新 full/week/day metadata 覆盖的文件是否显示为 `SKIP`；
 - 待导入的新文件是否显示为 `IMPORT`；
 - 是否有旧文件清理提示；
 - 是否有空间不足或 part 缺失提示。
@@ -150,6 +154,14 @@ Signature verification failed: verification timed out after 5 minutes
 
 如果根分区或 RocksDB 所在文件系统剩余空间不足，脚本也会提前退出。
 
+如果导入 day 包时日志出现：
+
+```text
+Failed to validate metadata: dump data was already loaded
+```
+
+通常表示该 day 包已经被之前导入的 week 包或其他增量包覆盖。脚本会将这种情况视为已加载并继续执行，不会中断后续导入。
+
 ## 自动清理逻辑
 
 每次脚本运行时会检查 `/tmp` 下超过 15 天的 dump zip 文件。
@@ -185,7 +197,7 @@ DRY-RUN would delete old imported dump
 - 导入时间；
 - 文件名；
 - 文件大小；
-- sha256；
+- 状态标记，当前为 `name_size_only`；
 - 文件路径。
 
 一般情况下不要手动修改该文件。只有在 RocksDB 重建、清空、回滚或从备份恢复后，才需要检查或清理它。
@@ -195,7 +207,7 @@ DRY-RUN would delete old imported dump
 当前脚本 SHA256：
 
 ```text
-3bd72aff9605b1b1d3d11da0f92956f2f3e1c6cbd14a89b13ed91c751c034661
+4f5807f02e9d91d1059f5172a6b0896bc8718a97e871b85b99e2b291b5a3ef98
 ```
 
 在 RSDB 服务器上可以用以下命令校验：
