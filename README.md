@@ -2,6 +2,12 @@
 
 中文 | [English](README.en.md)
 
+## 简介
+
+该脚本用于 FortiEDR air-gapped 或离线部署场景。当 FortiEDR 环境无法直接从 Fortinet 云端获取 reputation 数据时，可以先在外部环境下载 full、week、day 级别的 reputation dump zip 文件，再上传到 RSDB 服务器的 `/tmp` 目录，由本脚本按正确顺序自动导入到 FortiEDR Reputation DB Server。
+
+脚本重点解决离线导入过程中的几个常见问题：大 full 包导入耗时长、签名校验容易受临时目录性能影响、多个 dump 包之间存在覆盖关系、重复导入会导致 metadata 校验失败，以及后续增量包需要持续、安全地导入。
+
 ## 脚本位置
 
 RSDB 服务器上的脚本路径：

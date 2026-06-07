@@ -2,6 +2,12 @@
 
 [中文](README.md) | English
 
+## Overview
+
+This script is intended for FortiEDR air-gapped or offline deployments. When a FortiEDR environment cannot retrieve reputation data directly from the Fortinet cloud, operators can download full, week, and day reputation dump zip files in an external environment, upload them to `/tmp` on the RSDB server, and use this script to import them into FortiEDR Reputation DB Server in the correct order.
+
+It addresses common operational issues in offline RSDB imports: large full dumps take a long time to process, signature verification can be sensitive to temporary directory performance, dump files can overlap in coverage, repeated imports can fail metadata validation, and later incremental week/day packages need to be imported safely without reloading already-covered data.
+
 ## Script Location
 
 On the RSDB server:
