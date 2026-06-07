@@ -23,8 +23,11 @@ This script automatically imports FortiEDR Reputation dump zip files from `/tmp`
 - Uses `/tmp/rsdb_ramwork` as a `tmpfs` RAM work directory to reduce the risk of signature verification timeout for large full dump parts.
 - Avoids duplicate imports using:
   - `/var/lib/reputationdb/import_state/imported_dumps.tsv`
-  - `/var/log/reputationdb/cli/reputationdb.log*`
-- Records successful imports with filename, size, sha256, path, and timestamp.
+  - `reputationdb last-dump-metadata`
+  - `/var/log/reputationdb/cli/reputationdb*.log*`
+- Uses the latest DB metadata to skip files already covered by a newer dump, for example day dumps covered by an imported week dump.
+- Treats `dump data was already loaded` from `reputationdb` as an already-loaded condition and continues with the next file.
+- Records successful imports with filename, size, path, and timestamp; it no longer calculates sha256 for multi-GB dump files.
 - Automatically removes imported dump zip files in `/tmp` when they are older than 15 days.
 - Exits if another `reputationdb load-dump` process is already running.
 
@@ -62,6 +65,7 @@ Check the output for:
 
 - whether the `full`, `week`, and `day` order is correct;
 - whether already imported files are shown as `SKIP`;
+- whether files covered by the latest full/week/day metadata are shown as `SKIP`;
 - whether new files to import are shown as `IMPORT`;
 - whether old-file cleanup messages are expected;
 - whether there are disk space or missing part warnings.
@@ -150,6 +154,14 @@ If `/tmp/rsdb_ramwork` does not have enough free space, the script exits before 
 
 If the root filesystem or the filesystem containing RocksDB has insufficient free space, the script also exits early.
 
+If a day dump fails metadata validation with:
+
+```text
+Failed to validate metadata: dump data was already loaded
+```
+
+it usually means that the day dump was already covered by a previously imported week dump or another incremental dump. The script treats this as already loaded and continues instead of stopping the run.
+
 ## Automatic Cleanup
 
 Each run checks dump zip files in `/tmp` that are older than 15 days.
@@ -185,7 +197,7 @@ Each record includes:
 - import time;
 - filename;
 - file size;
-- sha256;
+- state marker, currently `name_size_only`;
 - file path.
 
 Do not manually edit this file during normal operation. Review or clear it only after RocksDB is rebuilt, cleared, rolled back, or restored from backup.
@@ -195,7 +207,7 @@ Do not manually edit this file during normal operation. Review or clear it only 
 Current script SHA256:
 
 ```text
-3bd72aff9605b1b1d3d11da0f92956f2f3e1c6cbd14a89b13ed91c751c034661
+4f5807f02e9d91d1059f5172a6b0896bc8718a97e871b85b99e2b291b5a3ef98
 ```
 
 Verify it on the RSDB server:
