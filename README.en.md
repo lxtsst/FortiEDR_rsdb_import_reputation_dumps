@@ -31,7 +31,7 @@ This script automatically imports FortiEDR Reputation dump zip files from `/tmp`
   - `/var/lib/reputationdb/import_state/imported_dumps.tsv`
   - `reputationdb last-dump-metadata`
   - `/var/log/reputationdb/cli/reputationdb*.log*`
-- Uses the latest DB metadata to skip files already covered by a newer dump, for example day dumps covered by an imported week dump.
+- Uses the latest DB metadata to skip files actually covered by a newer dump, for example day dumps covered by an imported week dump. Full, week, and day packages dated after the metadata cursor are never skipped solely because of their type.
 - Treats `dump data was already loaded` from `reputationdb` as an already-loaded condition and continues with the next file.
 - Records successful imports with filename, size, path, and timestamp; it no longer calculates sha256 for multi-GB dump files.
 - Automatically removes imported dump zip files in `/tmp` when they are older than 15 days.
@@ -71,7 +71,7 @@ Check the output for:
 
 - whether the `full`, `week`, and `day` order is correct;
 - whether already imported files are shown as `SKIP`;
-- whether files covered by the latest full/week/day metadata are shown as `SKIP`;
+- whether only files actually covered by the latest metadata time range are shown as `SKIP`;
 - whether new files to import are shown as `IMPORT`;
 - whether old-file cleanup messages are expected;
 - whether there are disk space or missing part warnings.
@@ -213,7 +213,7 @@ Do not manually edit this file during normal operation. Review or clear it only 
 Current script SHA256:
 
 ```text
-4f5807f02e9d91d1059f5172a6b0896bc8718a97e871b85b99e2b291b5a3ef98
+cc7db61d479d0c23b3fda401f7033d6aac69effe3014fd411acd7a73d5384d96
 ```
 
 Verify it on the RSDB server:
@@ -221,3 +221,15 @@ Verify it on the RSDB server:
 ```bash
 sha256sum /tmp/rsdb_import_reputation_dumps.sh
 ```
+
+## Repository Regression Check
+
+Run this check before changing or publishing the script:
+
+```bash
+bash tests/coverage_logic_test.sh
+```
+
+The check ensures that stale day metadata cannot skip a later week or full
+package, while preserving the rule that a week package covers day packages
+within its metadata range.

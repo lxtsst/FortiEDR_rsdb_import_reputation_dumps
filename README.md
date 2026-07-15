@@ -31,7 +31,7 @@ RSDB 服务器上的脚本路径：
   - `/var/lib/reputationdb/import_state/imported_dumps.tsv`
   - `reputationdb last-dump-metadata`
   - `/var/log/reputationdb/cli/reputationdb*.log*`
-- 支持根据最新 DB metadata 判断覆盖关系，例如 week 包已经覆盖的 day 包会自动跳过。
+- 根据最新 DB metadata 判断覆盖关系，例如已导入的 week 包会跳过其时间范围内的 day 包。metadata 游标日期之后的 full、week、day 包不会仅因包类型而被跳过。
 - 如果 `reputationdb` 返回 `dump data was already loaded`，脚本会按已加载处理并继续后续文件。
 - 成功导入后记录文件名、大小、路径和时间；不再对多 GB dump 文件计算 sha256。
 - 自动清理 `/tmp` 下超过 15 天且已确认导入成功的 dump zip 文件。
@@ -71,7 +71,7 @@ ps -eo pid,etime,pcpu,pmem,args | grep "reputationdb load-dump" | grep -v grep |
 
 - full、week、day 的导入顺序是否正确；
 - 已导入的文件是否显示为 `SKIP`；
-- 已被最新 full/week/day metadata 覆盖的文件是否显示为 `SKIP`；
+- 仅确实被最新 metadata 时间范围覆盖的文件是否显示为 `SKIP`；
 - 待导入的新文件是否显示为 `IMPORT`；
 - 是否有旧文件清理提示；
 - 是否有空间不足或 part 缺失提示。
@@ -213,7 +213,7 @@ DRY-RUN would delete old imported dump
 当前脚本 SHA256：
 
 ```text
-4f5807f02e9d91d1059f5172a6b0896bc8718a97e871b85b99e2b291b5a3ef98
+cc7db61d479d0c23b3fda401f7033d6aac69effe3014fd411acd7a73d5384d96
 ```
 
 在 RSDB 服务器上可以用以下命令校验：
@@ -221,3 +221,13 @@ DRY-RUN would delete old imported dump
 ```bash
 sha256sum /tmp/rsdb_import_reputation_dumps.sh
 ```
+
+## 仓库回归测试
+
+在修改或发布脚本前，运行以下检查：
+
+```bash
+bash tests/coverage_logic_test.sh
+```
+
+该测试确保较旧的 day metadata 不会错误跳过日期更新的 week 或 full 包，同时保留 week 包对其覆盖范围内 day 包的跳过逻辑。
