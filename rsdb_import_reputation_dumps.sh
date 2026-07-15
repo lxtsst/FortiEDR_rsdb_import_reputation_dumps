@@ -138,16 +138,20 @@ covered_by_latest_metadata() {
     fi
   fi
 
-  if (( rank < LATEST_META_RANK )); then
-    return 0
-  fi
-  if (( rank > LATEST_META_RANK )); then
-    return 1
-  fi
+  # A package dated after the current metadata cursor cannot be covered by it,
+  # regardless of whether it is a full, week, or day package. Compare dates
+  # before applying the same-date type and part tie-breakers below.
   if [[ "$date" < "$LATEST_META_DATE" ]]; then
     return 0
   fi
   if [[ "$date" > "$LATEST_META_DATE" ]]; then
+    return 1
+  fi
+
+  if (( rank < LATEST_META_RANK )); then
+    return 0
+  fi
+  if (( rank > LATEST_META_RANK )); then
     return 1
   fi
   (( part <= LATEST_META_PART ))
@@ -555,4 +559,6 @@ main() {
   rm -f "$plan_file"
 }
 
-main
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main
+fi
