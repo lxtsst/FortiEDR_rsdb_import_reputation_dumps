@@ -164,7 +164,13 @@ state_has_basename() {
 }
 
 file_size() {
-  wc -c < "$1" | tr -d '[:space:]'
+  local size
+
+  if size="$(stat -c '%s' "$1" 2>/dev/null)"; then
+    printf '%s\n' "$size"
+  else
+    stat -f '%z' "$1"
+  fi
 }
 
 state_has_file() {

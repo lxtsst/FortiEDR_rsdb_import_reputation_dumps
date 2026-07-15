@@ -55,6 +55,15 @@ assert_not_imported_path() {
   fi
 }
 
+assert_file_size() {
+  local expected="$1"
+  local path="$2"
+  local actual
+
+  actual="$(file_size "$path")"
+  [[ "$actual" == "$expected" ]] || fail "expected size $expected, got $actual: $path"
+}
+
 set_metadata_cursor day 2026-06-04 2026-06-05 1
 assert_covered "reputation-day-2026-06-04-part_part_1.zip"
 assert_covered "reputation-day-2026-06-05-part_part_1.zip"
@@ -73,6 +82,7 @@ TEST_DUMP="$TEST_TMPDIR/reputation-week-2026-07-15-part_part_1.zip"
 printf 'new-payload' > "$TEST_DUMP"
 TEST_DUMP_BASE="$(basename "$TEST_DUMP")"
 TEST_DUMP_SIZE="$(file_size "$TEST_DUMP")"
+assert_file_size 11 "$TEST_DUMP"
 
 LATEST_META_RANK=""
 LATEST_META_DATE=""

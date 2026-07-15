@@ -216,7 +216,7 @@ Do not manually edit this file during normal operation. Review or clear it only 
 Current script SHA256:
 
 ```text
-ce4cd050c4fb1ed47dcb6209022da30fdcefec9cdffc1a43d248e29e973fa96b
+77aa665e1ba639927def15ab853bb11f1a80a00baa109c14e5410ab7d34d8f6b
 ```
 
 Verify it on the RSDB server:
