@@ -28,9 +28,8 @@ This script automatically imports FortiEDR Reputation dump zip files from `/tmp`
 - Sorts files of the same type by date and part number.
 - Uses `/tmp/rsdb_ramwork` as a `tmpfs` RAM work directory to reduce the risk of signature verification timeout for large full dump parts.
 - Avoids duplicate imports using:
-  - `/var/lib/reputationdb/import_state/imported_dumps.tsv`
+  - a matching filename and file size in `/var/lib/reputationdb/import_state/imported_dumps.tsv`
   - `reputationdb last-dump-metadata`
-  - `/var/log/reputationdb/cli/reputationdb*.log*`
 - Uses the latest DB metadata to skip files actually covered by a newer dump, for example day dumps covered by an imported week dump. Full, week, and day packages dated after the metadata cursor are never skipped solely because of their type.
 - Treats `dump data was already loaded` from `reputationdb` as an already-loaded condition and continues with the next file.
 - Records successful imports with filename, size, path, and timestamp; it no longer calculates sha256 for multi-GB dump files.
@@ -48,6 +47,8 @@ This script automatically imports FortiEDR Reputation dump zip files from `/tmp`
 ```
 
 Otherwise, the script may skip files recorded in the old state file even though the data is no longer present in RocksDB.
+
+Historical CLI logs are diagnostic evidence only; they are not used as proof that the current database loaded a package. This prevents old logs from skipping packages after a RocksDB rebuild or rollback.
 
 The script may print a notice that `reputationDBServer --server` is running. This is the resident RSDB service and imports can usually continue. If an import fails with a RocksDB `LOCK` error, consider stopping the service before retrying.
 
@@ -206,6 +207,8 @@ Each record includes:
 - state marker, currently `name_size_only`;
 - file path.
 
+For a file that is still present, the state file marks it as imported only when both its filename and size match. A same-name file with a different size continues through the import and product metadata checks.
+
 Do not manually edit this file during normal operation. Review or clear it only after RocksDB is rebuilt, cleared, rolled back, or restored from backup.
 
 ## Script Verification
@@ -213,7 +216,7 @@ Do not manually edit this file during normal operation. Review or clear it only 
 Current script SHA256:
 
 ```text
-cc7db61d479d0c23b3fda401f7033d6aac69effe3014fd411acd7a73d5384d96
+ce4cd050c4fb1ed47dcb6209022da30fdcefec9cdffc1a43d248e29e973fa96b
 ```
 
 Verify it on the RSDB server:
@@ -231,5 +234,6 @@ bash tests/coverage_logic_test.sh
 ```
 
 The check ensures that stale day metadata cannot skip a later week or full
-package, while preserving the rule that a week package covers day packages
-within its metadata range.
+package, same-name state records with a different size cannot skip the current
+file, and historical CLI success markers cannot override current state or
+metadata.

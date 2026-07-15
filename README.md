@@ -28,9 +28,8 @@ RSDB 服务器上的脚本路径：
 - 同类型文件按日期和 part 编号排序导入。
 - 使用 `/tmp/rsdb_ramwork` 作为 `tmpfs` 内存工作目录，避免大 full 包签名校验超时。
 - 防止重复导入，判断依据包括：
-  - `/var/lib/reputationdb/import_state/imported_dumps.tsv`
+  - `/var/lib/reputationdb/import_state/imported_dumps.tsv` 中相同文件名和文件大小的记录
   - `reputationdb last-dump-metadata`
-  - `/var/log/reputationdb/cli/reputationdb*.log*`
 - 根据最新 DB metadata 判断覆盖关系，例如已导入的 week 包会跳过其时间范围内的 day 包。metadata 游标日期之后的 full、week、day 包不会仅因包类型而被跳过。
 - 如果 `reputationdb` 返回 `dump data was already loaded`，脚本会按已加载处理并继续后续文件。
 - 成功导入后记录文件名、大小、路径和时间；不再对多 GB dump 文件计算 sha256。
@@ -48,6 +47,8 @@ RSDB 服务器上的脚本路径：
 ```
 
 否则脚本可能会根据旧状态跳过某些文件，但这些数据实际已经不在 RocksDB 中。
+
+历史 CLI 日志仅用于故障诊断，不作为当前 DB 已加载的判断依据。这样在 RocksDB 重建或回滚后，旧日志不会造成错误跳包。
 
 脚本运行时可能提示 `reputationDBServer --server` 正在运行。这个服务是 RSDB 常驻服务，通常可以继续导入。只有在导入失败并出现 RocksDB `LOCK` 错误时，才考虑停止服务后重试。
 
@@ -206,6 +207,8 @@ DRY-RUN would delete old imported dump
 - 状态标记，当前为 `name_size_only`；
 - 文件路径。
 
+对当前仍存在的文件，只有文件名和文件大小都匹配时才会被状态文件判定为已导入；同名但大小不同的文件会继续走导入和产品 metadata 校验。
+
 一般情况下不要手动修改该文件。只有在 RocksDB 重建、清空、回滚或从备份恢复后，才需要检查或清理它。
 
 ## 脚本校验
@@ -213,7 +216,7 @@ DRY-RUN would delete old imported dump
 当前脚本 SHA256：
 
 ```text
-cc7db61d479d0c23b3fda401f7033d6aac69effe3014fd411acd7a73d5384d96
+ce4cd050c4fb1ed47dcb6209022da30fdcefec9cdffc1a43d248e29e973fa96b
 ```
 
 在 RSDB 服务器上可以用以下命令校验：
@@ -230,4 +233,4 @@ sha256sum /tmp/rsdb_import_reputation_dumps.sh
 bash tests/coverage_logic_test.sh
 ```
 
-该测试确保较旧的 day metadata 不会错误跳过日期更新的 week 或 full 包，同时保留 week 包对其覆盖范围内 day 包的跳过逻辑。
+该测试确保较旧的 day metadata 不会错误跳过日期更新的 week 或 full 包，同名不同大小的状态记录不会跳过当前文件，历史 CLI 成功日志也不会覆盖当前状态或 metadata。

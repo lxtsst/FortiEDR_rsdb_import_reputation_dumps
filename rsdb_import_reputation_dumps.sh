@@ -8,7 +8,6 @@ STATE_DIR="/var/lib/reputationdb/import_state"
 STATE_FILE="$STATE_DIR/imported_dumps.tsv"
 LOCK_FILE="$STATE_DIR/import.lock"
 RUN_LOG_DIR="/var/log/reputationdb/import_runner"
-CLI_LOG="/var/log/reputationdb/cli/reputationdb.log"
 RETENTION_DAYS=15
 ROCKSDB_PATH="/var/lib/reputationdb/rocksdb_data"
 ONE_GIB=1073741824
@@ -30,7 +29,8 @@ Usage:
 Behavior:
   - Discovers reputation dump zip files in /tmp.
   - Imports in order: full, then week, then day.
-  - Skips files already recorded in state or already completed in reputationdb CLI logs.
+  - Skips files already recorded in state with the same name and size, or
+    covered by current reputationdb metadata.
   - Uses /tmp/rsdb_ramwork tmpfs as the working directory for large full parts.
   - Records successful imports in /var/lib/reputationdb/import_state/imported_dumps.tsv.
   - New records use file name and size only to avoid hashing multi-GB dump files.
@@ -163,55 +163,28 @@ state_has_basename() {
   awk -F '\t' -v b="$base" '$2 == b { found=1 } END { exit found ? 0 : 1 }' "$STATE_FILE"
 }
 
+file_size() {
+  wc -c < "$1" | tr -d '[:space:]'
+}
+
 state_has_file() {
   local path="$1"
   local base size
   base="$(basename "$path")"
   [[ -f "$STATE_FILE" ]] || return 1
-  size="$(stat -c '%s' "$path")"
+  size="$(file_size "$path")"
 
   awk -F '\t' -v b="$base" -v s="$size" '
     $2 == b {
-      found=1
-      if ($3 != s) size_mismatch=1
+      if ($3 == s) size_match=1
+      else size_mismatch=1
     }
     END {
-      if (found && size_mismatch) exit 2
-      exit found ? 0 : 1
+      if (size_match) exit 0
+      if (size_mismatch) exit 2
+      exit 1
     }
   ' "$STATE_FILE"
-}
-
-completed_in_cli_log() {
-  local base="$1"
-  local log_file parsed type date part
-
-  parsed="$(parse_dump_basename "$base")" || return 1
-  IFS='|' read -r type date part <<< "$parsed"
-
-  # Successful imports write metadata near the end of the operation. Matching
-  # metadata is more reliable than matching the initial "Validating..." line,
-  # because multi-hour full imports can rotate CLI logs between start and finish.
-  # FortiEDR rotates CLI logs as reputationdb-<timestamp>.log.gz, not only
-  # reputationdb.log.*. Scan both forms so old successful full parts are found.
-  for log_file in "$CLI_LOG" /var/log/reputationdb/cli/reputationdb*.log*; do
-    [[ -e "$log_file" ]] || continue
-    if [[ "$log_file" == *.gz ]]; then
-      zcat -- "$log_file" 2>/dev/null
-    else
-      cat -- "$log_file" 2>/dev/null
-    fi | awk -v type="$type" -v date="$date" -v part="$part" '
-      index($0, "Saving metadata Dump metadata.") &&
-      index($0, "type: " type) &&
-      index($0, "to:" date) &&
-      index($0, "partNum: " part " ") {
-        found=1
-      }
-      END { exit found ? 0 : 1 }
-    ' && return 0
-  done
-
-  return 1
 }
 
 part_log_already_loaded() {
@@ -219,16 +192,28 @@ part_log_already_loaded() {
   grep -qi "dump data was already loaded" "$part_log"
 }
 
-is_imported() {
+is_imported_path() {
+  local path="$1"
+  local base
+
+  base="$(basename "$path")"
+  if state_has_file "$path"; then
+    return 0
+  fi
+
+  covered_by_latest_metadata "$base"
+}
+
+is_imported_basename() {
   local base="$1"
-  state_has_basename "$base" || covered_by_latest_metadata "$base" || completed_in_cli_log "$base"
+  state_has_basename "$base" || covered_by_latest_metadata "$base"
 }
 
 record_imported() {
   local path="$1"
   local base size rc
   base="$(basename "$path")"
-  size="$(stat -c '%s' "$path")"
+  size="$(file_size "$path")"
 
   set +e
   state_has_file "$path"
@@ -276,7 +261,7 @@ cleanup_old_imported_dumps() {
       continue
     fi
 
-    if is_imported "$base"; then
+    if is_imported_path "$path"; then
       if [[ "$MODE" == "dry-run" ]]; then
         log "DRY-RUN would delete old imported dump: $path"
       else
@@ -351,7 +336,7 @@ check_filesystem_space() {
 check_workdir_space_for_dump() {
   local path="$1"
   local dump_size required available
-  dump_size="$(stat -c '%s' "$path")"
+  dump_size="$(file_size "$path")"
   required=$((dump_size + ONE_GIB))
   available="$(bytes_available "$WORKDIR")"
 
@@ -406,7 +391,7 @@ validate_contiguous_parts() {
       fi
 
       base="$(expected_basename "$type" "$date" "$i")"
-      if is_imported "$base"; then
+      if is_imported_basename "$base"; then
         continue
       fi
 
@@ -439,11 +424,6 @@ import_one() {
 
   if covered_by_latest_metadata "$base"; then
     log "SKIP already covered by latest DB metadata: $base"
-    return 0
-  fi
-
-  if completed_in_cli_log "$base"; then
-    log "SKIP already imported from CLI log: $base"
     return 0
   fi
 
@@ -481,7 +461,7 @@ import_one() {
     exit "$rc"
   fi
 
-  if ! grep -q "Load dump successfully" "$part_log" && ! completed_in_cli_log "$base"; then
+  if ! grep -q "Load dump successfully" "$part_log"; then
     if part_log_already_loaded "$part_log"; then
       log "SKIP already loaded according to reputationdb metadata validation: $base"
       record_imported "$path"
@@ -534,7 +514,7 @@ main() {
 
   log "Planned order:"
   while IFS='|' read -r _rank date _part_padded type part path; do
-    if is_imported "$(basename "$path")"; then
+    if is_imported_path "$path"; then
       printf "  SKIP   %-4s %s part %s %s\n" "$type" "$date" "$part" "$path"
     else
       printf "  IMPORT %-4s %s part %s %s\n" "$type" "$date" "$part" "$path"
