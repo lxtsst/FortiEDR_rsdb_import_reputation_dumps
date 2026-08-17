@@ -23,6 +23,7 @@ LATEST_META_PART=""
 LATEST_META_TYPE=""
 COVERAGE_GAP_TYPE=""
 COVERAGE_GAP_DATE=""
+INITIAL_CURSOR_AVAILABLE=0
 
 usage() {
   cat <<'USAGE'
@@ -439,6 +440,73 @@ discover_files() {
   done | sort -t '|' -k1,1n -k3,3 -k2,2n -k4,4n | cut -d '|' -f2-
 }
 
+report_nonconforming_reputation_archives() {
+  local path base found=0
+
+  while IFS= read -r path; do
+    base="$(basename "$path")"
+    if parse_dump_basename "$base" >/dev/null; then
+      continue
+    fi
+
+    if (( found == 0 )); then
+      log "WARNING: Found ZIP archive file(s) that do not match the required reputation-dump filename format and will not be imported:"
+    fi
+    printf '  %s\n' "$path"
+    found=1
+  done < <(find "$SRC_DIR" -maxdepth 1 -type f -name '*.zip' -print | sort)
+
+  if (( found )); then
+    log "Restore the original FortiEDR filename before running the importer."
+    return 1
+  fi
+  return 0
+}
+
+state_has_records() {
+  [[ -f "$STATE_FILE" ]] || return 1
+  awk 'NF { found=1 } END { exit found ? 0 : 1 }' "$STATE_FILE"
+}
+
+validate_bootstrap_preconditions() {
+  local plan_file="$1"
+  local _rank date _part_padded type _part _path full_count=0
+  local -a full_dates=()
+  declare -A seen_full_dates=()
+
+  (( INITIAL_CURSOR_AVAILABLE == 0 )) || return 0
+
+  # A state row without current DB metadata cannot prove that the database is
+  # still populated. Do not let it make a fresh or unreadable RSDB look ready.
+  if state_has_records; then
+    echo "RSDB metadata has no parseable cursor while $STATE_FILE contains import-state records. Abort: do not trust state records as a bootstrap baseline. Verify the database, then clear or retain the state file deliberately before retrying." >&2
+    return 1
+  fi
+
+  while IFS='|' read -r _rank date _part_padded type _part _path; do
+    [[ "$type" == "full" ]] || continue
+    if [[ -n "${seen_full_dates[$date]:-}" ]]; then
+      continue
+    fi
+    seen_full_dates["$date"]=1
+    full_dates+=("$date")
+    full_count=$((full_count + 1))
+  done < "$plan_file"
+
+  if (( full_count == 0 )); then
+    echo "RSDB has no parseable metadata cursor and no full dump is available in $SRC_DIR. A new or empty RSDB must start from one complete full dump; weekly and daily dumps are incremental only. Abort without calling reputationdb." >&2
+    return 1
+  fi
+
+  if (( full_count > 1 )); then
+    echo "RSDB has no parseable metadata cursor and multiple full dump dates are present. Abort without choosing one automatically; keep exactly one complete full dump date in $SRC_DIR for bootstrap:" >&2
+    printf '  reputation-full-%s-part_part_*.zip\n' "${full_dates[@]}" >&2
+    return 1
+  fi
+
+  log "Bootstrap mode: no current DB cursor is available; using complete full dump date ${full_dates[0]} as the required initial baseline."
+}
+
 has_new_week_on_date() {
   local plan_file="$1"
   local target_date="$2"
@@ -524,6 +592,56 @@ days_between() {
   start_epoch="$(date_to_epoch "$start_date")"
   end_epoch="$(date_to_epoch "$end_date")"
   printf '%s\n' "$(((end_epoch - start_epoch) / 86400))"
+}
+
+print_no_package_download_guidance() {
+  local today cursor checkpoint delta tail_start
+
+  log "No matching reputation dump files found in $SRC_DIR."
+  report_nonconforming_reputation_archives || true
+
+  if (( INITIAL_CURSOR_AVAILABLE == 0 )) || [[ -z "$LATEST_META_DATE" ]]; then
+    log "Cannot create a safe incremental download plan because RSDB has no parseable metadata cursor."
+    if state_has_records; then
+      log "Import-state records exist, but they are not a substitute for current DB metadata. Resolve the metadata read first."
+    else
+      log "For a new or empty RSDB, download exactly one complete current full dump bundle first. After placing it in $SRC_DIR, run --dry-run; the importer will validate the later week/day chain from that full dump date."
+    fi
+    return 0
+  fi
+
+  # Dump metadata dates represent UTC day boundaries on this RSDB build; keep
+  # the recommendation date arithmetic in the same time basis.
+  today="$(date -u '+%F')"
+  if [[ "$LATEST_META_DATE" > "$today" || "$LATEST_META_DATE" == "$today" ]]; then
+    log "DB metadata already ends at $LATEST_META_DATE; this is current relative to the current UTC date $today. No update package is recommended."
+    return 0
+  fi
+
+  delta="$(days_between "$LATEST_META_DATE" "$today")"
+  log "DB metadata ends at $LATEST_META_DATE; current UTC date is $today (${delta} day(s) later)."
+  log "Recommended low-overlap download plan (based on package dates, not a live package-portal inventory):"
+  log "  Prefer one week package for each complete seven-day interval, then daily packages only for the remaining tail."
+
+  cursor="$LATEST_META_DATE"
+  while (( $(days_between "$cursor" "$today") >= 7 )); do
+    checkpoint="$(date_add_days "$cursor" 7)"
+    printf '  week: reputation-week-%s-part_part_*.zip\n' "$checkpoint"
+    printf '    fallback if unavailable: reputation-day-%s through reputation-day-%s\n' \
+      "$(date_add_days "$cursor" 1)" "$checkpoint"
+    cursor="$checkpoint"
+  done
+
+  if [[ "$cursor" < "$today" ]]; then
+    tail_start="$(date_add_days "$cursor" 1)"
+    log "  Daily tail (no intentional weekly overlap):"
+    while [[ "$tail_start" < "$today" || "$tail_start" == "$today" ]]; do
+      printf '  day:  reputation-day-%s-part_part_*.zip\n' "$tail_start"
+      tail_start="$(date_add_days "$tail_start" 1)"
+    done
+  fi
+
+  log "Use packages with the listed dates. If a recommended week package is not published, use its printed daily fallback range rather than skipping the interval. Re-run --dry-run after copying packages to $SRC_DIR."
 }
 
 missing_day_dates() {
@@ -850,8 +968,11 @@ main() {
 
   assert_no_load_running
   warn_reputationdb_server_running
-  if ! load_latest_metadata_cursor; then
-    log "Continuing without an initial DB metadata cursor. Exact state records remain usable, but coverage-based skips require a later successful metadata refresh."
+  if load_latest_metadata_cursor; then
+    INITIAL_CURSOR_AVAILABLE=1
+  else
+    INITIAL_CURSOR_AVAILABLE=0
+    log "No initial DB metadata cursor is available. An existing RSDB must restore metadata access; a new RSDB must provide exactly one complete full dump bundle."
   fi
   ensure_workdir
   check_filesystem_space
@@ -863,13 +984,19 @@ main() {
   discover_files > "$plan_file"
 
   if [[ ! -s "$plan_file" ]]; then
-    log "No matching reputation dump files found in $SRC_DIR"
+    print_no_package_download_guidance
     rm -f "$plan_file"
     rm -f "$prefix_plan_file"
     exit 0
   fi
 
   validate_contiguous_parts "$plan_file"
+  if ! validate_bootstrap_preconditions "$plan_file"; then
+    log "Bootstrap preflight stopped the run. No dump was imported and no old dump file was deleted."
+    rm -f "$plan_file"
+    rm -f "$prefix_plan_file"
+    exit 1
+  fi
   if ! resolve_incremental_coverage "$plan_file" "$prefix_plan_file"; then
     log "Incremental coverage preflight stopped the run. No dump was imported and no old dump file was deleted."
     rm -f "$plan_file"

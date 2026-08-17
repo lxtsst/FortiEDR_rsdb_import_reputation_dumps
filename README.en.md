@@ -1,14 +1,33 @@
-# FortiEDR RSDB Reputation Dump Importer
+<div align="center">
 
-[中文](README.md) | English
+<h1>FortiEDR RSDB Reputation Dump Importer</h1>
 
-This project provides a guarded shell-based workflow for importing FortiEDR
-Reputation DB dump packages into an air-gapped or offline RSDB server. It is
-designed for operators who download reputation packages from a connected
-environment and place them in `/tmp` on the RSDB server.
+<p>Guarded imports for air-gapped and offline RSDB servers</p>
 
-> This is an operational helper, not an official Fortinet product component.
-> Validate it on a test RSDB before using it in production.
+<p>
+  <img alt="FortiEDR RSDB" src="https://img.shields.io/badge/FortiEDR-RSDB%20Reputation-E8002D?logo=fortinet&amp;logoColor=white">
+  <img alt="Air-gapped workflow" src="https://img.shields.io/badge/Workflow-Air--gapped-0969DA">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-1A7F37">
+</p>
+
+<p><a href="README.md">中文</a> · <a href="#quick-start">Quick Start</a> · <a href="#logs-and-state">Logs and State</a></p>
+
+</div>
+
+This project provides a guarded shell-based workflow for importing FortiEDR Reputation DB dump packages into an air-gapped or offline RSDB server. Download the packages from a connected environment, then copy the original files directly into `/tmp` on the RSDB server.
+
+> [!CAUTION]
+> This is an operational helper, not an official Fortinet product component. Validate it on a test RSDB before using it in production.
+
+## Highlights
+
+| Capability | What it does |
+| --- | --- |
+| 📦 Package planning | Discovers full, week, and day packages and orders them safely. |
+| 🧭 Chain protection | Detects gaps, backfills, and missing parts before invoking the product CLI. |
+| 🛡️ Coverage protection | Uses RSDB metadata and local state to avoid unnecessary repeat imports. |
+| 🧾 Audit trail | Creates per-package product logs and persistent handled-file state. |
+| 💡 Empty-directory guidance | Recommends a low-overlap download chain when `/tmp` has no valid package. |
 
 ## Included Files
 
@@ -31,35 +50,54 @@ environment and place them in `/tmp` on the RSDB server.
   reputation-day-YYYY-MM-DD-part_part_N.zip
   ```
 
+- For a new or empty RSDB, place exactly one complete full-dump date in `/tmp`
+  before adding incremental packages. Do not mix historical full snapshots into
+  the bootstrap directory.
+
 - The script uses `/tmp/rsdb_ramwork` as a `tmpfs` working directory. It
   mounts it automatically when needed and requires enough RAM-backed space for
   the active package plus 1 GiB.
 
+  This is an archive-size guard, not a prediction of product decompression or
+  RocksDB growth. Size RAM and disk capacity for the full dump according to
+  the FortiEDR version and the largest package you intend to import.
+
 ## Quick Start
 
-Copy the main script to the RSDB server, then run a dry-run before any import:
+```mermaid
+flowchart LR
+    A["Download packages on a connected host"] --> B["Copy original files to RSDB /tmp"]
+    B --> C["Run dry-run and review the plan"]
+    C --> D{"Valid plan and coverage chain?"}
+    D -->|Yes| E["Run import and retain logs"]
+    D -->|No| F["Download missing packages or use the safe prefix"]
 
-```bash
-chmod 700 /tmp/rsdb_import_reputation_dumps.sh
-/tmp/rsdb_import_reputation_dumps.sh --dry-run
+    classDef source fill:#0969DA,color:#FFFFFF,stroke:#0969DA;
+    classDef check fill:#8250DF,color:#FFFFFF,stroke:#8250DF;
+    classDef go fill:#1A7F37,color:#FFFFFF,stroke:#1A7F37;
+    classDef stop fill:#CF222E,color:#FFFFFF,stroke:#CF222E;
+    class A,B source;
+    class C,D check;
+    class E go;
+    class F stop;
 ```
 
-When the plan is correct, run the normal importer:
+1. Copy the main script to the RSDB server, then run a dry-run before any import:
 
-```bash
-/tmp/rsdb_import_reputation_dumps.sh
-```
+   ```bash
+   chmod 700 /tmp/rsdb_import_reputation_dumps.sh
+   /tmp/rsdb_import_reputation_dumps.sh --dry-run
+   ```
 
-To preserve one combined terminal log in addition to the per-package logs:
+2. When the plan is correct, run the normal importer and retain one combined terminal log:
 
-```bash
-set -o pipefail
-/tmp/rsdb_import_reputation_dumps.sh 2>&1 | tee "/var/log/reputationdb/import_runner/import_$(date '+%Y%m%d_%H%M%S').log"
-```
+   ```bash
+   set -o pipefail
+   /tmp/rsdb_import_reputation_dumps.sh 2>&1 | tee "/var/log/reputationdb/import_runner/import_$(date '+%Y%m%d_%H%M%S').log"
+   ```
 
-Do not call `reputationdb load-dump` directly for normal operations. The
-importer adds ordering, coverage, logging, and state safeguards that the raw
-CLI does not provide.
+> [!TIP]
+> Do not call `reputationdb load-dump` directly for normal operations. The importer adds ordering, coverage, logging, and state safeguards that the raw CLI does not provide.
 
 ## Import Behavior
 
@@ -72,6 +110,20 @@ CLI does not provide.
 - Imports parts of the same package in ascending part number order.
 - Refuses incomplete part sequences unless the missing part is already known
   to be handled.
+- When RSDB has no readable metadata cursor, requires exactly one full-dump
+  date and an empty importer state file. It never treats state records alone
+  as proof that a fresh or unreadable database is ready for weekly or daily
+  updates.
+- If no matching package is present, prints a download recommendation based on
+  the current DB cursor and current UTC date: week checkpoints for complete
+  seven-day intervals, followed by a non-overlapping daily tail. The script
+  does not query the Fortinet package portal, so availability still needs to
+  be checked before downloading.
+- Lists ZIP files with nonconforming names when no valid package is found;
+  restore the original published name before retrying.
+- Does not assume that a later week package covers an earlier daily gap until
+  RSDB has actually returned that package's metadata. In that situation it
+  keeps the conservative gap stop or safe-prefix choice.
 
 ### Duplicate and coverage handling
 
