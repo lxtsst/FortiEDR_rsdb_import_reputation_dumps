@@ -13,8 +13,6 @@ FortiEDR RSDB 服务器中导入 Reputation dump 更新包。适用于在联网�
 | 文件 | 用途 |
 | --- | --- |
 | `rsdb_import_reputation_dumps.sh` | 常规 RSDB Reputation dump 安全导入脚本。 |
-| `rsdb_test_out_of_order_daily_imports.sh` | 仅限测试 RSDB 的辅助工具，用于记录产品对缺包、回补和重复日日包的直接处理行为。 |
-| `tests/coverage_logic_test.sh` | 导入计划与覆盖逻辑的本地回归测试。 |
 
 ## 运行要求
 
@@ -158,33 +156,6 @@ reputationdb last-dump-metadata
 
 如果 RocksDB 被重建、清空、回滚或从备份恢复，应先检查并通常清理
 `imported_dumps.tsv`。状态记录只对创建它的同一个数据库实例有效。
-
-## 仅测试 RSDB 使用的直接 CLI 工具
-
-`rsdb_test_out_of_order_daily_imports.sh` 仅用于可丢弃的测试 RSDB。它会为直接
-导入的日包序列创建证据包，并记录产品对重复包的接受或拒绝行为；不会修改常规
-导入脚本的状态文件。
-
-默认只做预检查：
-
-```bash
-/tmp/rsdb_test_out_of_order_daily_imports.sh \
-  --first 2026-08-12 --second 2026-08-14 --backfill 2026-08-13
-```
-
-只有在明确允许修改测试数据库时才加 `--run`。不要在生产 RSDB 上使用，也不要
-与常规导入脚本并发运行。
-
-## 本地回归检查
-
-修改或发布脚本前运行：
-
-```bash
-bash tests/coverage_logic_test.sh
-```
-
-该测试覆盖排序、metadata 覆盖边界、覆盖状态持久化、缺包检测、安全前缀选择和
-产品错误分类。
 
 ## 许可证
 

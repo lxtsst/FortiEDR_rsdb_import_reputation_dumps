@@ -15,8 +15,6 @@ environment and place them in `/tmp` on the RSDB server.
 | File | Purpose |
 | --- | --- |
 | `rsdb_import_reputation_dumps.sh` | Normal guarded importer for RSDB reputation dump packages. |
-| `rsdb_test_out_of_order_daily_imports.sh` | Optional test-RSDB utility for recording direct product behavior for gaps, backfills, and repeated daily packages. |
-| `tests/coverage_logic_test.sh` | Local regression test for importer planning and coverage logic. |
 
 ## Requirements
 
@@ -176,34 +174,6 @@ marker in its per-package output. It also identifies the product message
 If RocksDB is rebuilt, cleared, rolled back, or restored from backup, review
 and normally clear `imported_dumps.tsv` before using the importer again. A
 state record is valid only for the database instance that created it.
-
-## Test-Only Direct-CLI Utility
-
-`rsdb_test_out_of_order_daily_imports.sh` is for a disposable test RSDB only.
-It creates an evidence bundle for a direct daily-package sequence and records
-whether the product accepts or rejects a repeated package. It never updates
-the normal importer's state file.
-
-Its default mode is preflight only:
-
-```bash
-/tmp/rsdb_test_out_of_order_daily_imports.sh \
-  --first 2026-08-12 --second 2026-08-14 --backfill 2026-08-13
-```
-
-Use `--run` only after explicitly accepting writes to the test database. Do
-not use this utility on production RSDB or while the normal importer runs.
-
-## Local Regression Check
-
-Run before changing or publishing the scripts:
-
-```bash
-bash tests/coverage_logic_test.sh
-```
-
-The test covers ordering, metadata coverage boundaries, persisted coverage
-state, gap detection, safe-prefix selection, and product-error classification.
 
 ## License
 
