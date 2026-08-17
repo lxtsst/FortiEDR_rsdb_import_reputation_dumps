@@ -2,3 +2,7 @@
 *.log
 *.tmp
 *.swp
+
+# Local-only validation utilities
+rsdb_test_*.sh
+tests/
