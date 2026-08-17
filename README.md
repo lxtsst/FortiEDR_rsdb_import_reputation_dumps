@@ -40,7 +40,7 @@
 | 日包（`day`） | `reputation-day-YYYY-MM-DD-part_part_N.zip` | 补齐周包之间或最后不足七天的日期尾段。 |
 
 > [!IMPORTANT]
-> 新建或已清空的 RSDB：`/tmp`中必须只放一套完整、同一日期的完整包，再放后续增量包。不要把历史完整包快照与首次初始化包混放。
+> 新建或已清空的RSDB：`/tmp`中必须只放一套完整、同一日期的完整包，再放后续增量包。首次初始化必须显式使用`--bootstrap`，不要把历史完整包快照与首次初始化包混放。
 
 ## 运行要求
 
@@ -87,6 +87,13 @@ flowchart LR
    /tmp/rsdb_import_reputation_dumps.sh 2>&1 | tee "/var/log/reputationdb/import_runner/import_$(date '+%Y%m%d_%H%M%S').log"
    ```
 
+首次初始化已确认为空库时，使用`--bootstrap`：
+
+```bash
+/tmp/rsdb_import_reputation_dumps.sh --bootstrap --dry-run
+/tmp/rsdb_import_reputation_dumps.sh --bootstrap
+```
+
 > [!TIP]
 > 常规更新不要直接执行`reputationdb load-dump`。主脚本额外提供排序、连续链验证、覆盖判断、状态记录和日志保护。
 
@@ -97,7 +104,7 @@ flowchart LR
 - 完整包始终最先处理；其后按日期处理周包和日包。
 - 同一天同时存在周包和日包时，周包在前；日包会等待周包导入后返回的实际metadata再决定是否跳过。
 - 同一包的多个分片按分片编号递增导入；缺失分片且未被确认处理时，脚本停止。
-- 数据库没有可读的 metadata游标时，脚本只接受“唯一完整包 + 空状态文件”的首次初始化条件。
+- 数据库没有可读的metadata游标时，脚本默认停止；仅在明确使用`--bootstrap`且满足“唯一完整包 + 空状态文件”时才允许首次初始化。
 
 ### 计划状态
 
@@ -148,7 +155,7 @@ flowchart LR
 | --- | --- |
 | 数据库游标已到当前UTC日期 | 提示无需下载更新包。 |
 | 数据库游标落后 | 从游标起每满七天推荐一个周包；最后不足七天推荐连续日包，并给出周包不可用时的日包兜底区间。 |
-| 没有可读游标 | 不猜测增量日期；提示下载唯一完整的完整包。 |
+| 没有可读游标 | 不猜测增量日期；提示下载唯一完整的完整包，并在确认空库后使用`--bootstrap`。 |
 | 有不规范 ZIP 文件 | 列出文件，并提示恢复原厂文件名。 |
 
 下载建议基于包日期规则，并不查询Fortinet下载站。请确认对应日期包已发布后再下载；如果建议的周包不可用，请使用脚本列出的连续日包兜底区间，不能跳过日期。
@@ -158,6 +165,9 @@ flowchart LR
 ```text
 --dry-run
     只输出计划与检查结果；不调用load-dump，也不删除过期更新包。
+
+--bootstrap
+    明确授权首次初始化。仅用于已确认的新建或已清空RSDB；要求唯一完整包和空状态文件。
 
 --type all|full|week|day
     只发现指定类型的包。仅当所需前置更新链已存在于RSDB时使用。

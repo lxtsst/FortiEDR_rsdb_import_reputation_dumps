@@ -16,6 +16,7 @@ MIN_DB_AVAIL_BYTES=$((20 * ONE_GIB))
 MODE="run"
 ONLY_TYPE="all"
 COVERAGE_GAP_ACTION="prompt"
+BOOTSTRAP_REQUESTED=0
 LATEST_META_RANK=""
 LATEST_META_DATE=""
 LATEST_META_FROM_DATE=""
@@ -28,7 +29,7 @@ INITIAL_CURSOR_AVAILABLE=0
 usage() {
   cat <<'USAGE'
 Usage:
-  /tmp/rsdb_import_reputation_dumps.sh [--dry-run] [--type all|full|week|day] [--on-coverage-gap abort|prompt|import-prefix]
+  /tmp/rsdb_import_reputation_dumps.sh [--dry-run] [--bootstrap] [--type all|full|week|day] [--on-coverage-gap abort|prompt|import-prefix]
 
 Behavior:
   - Discovers reputation dump zip files in /tmp.
@@ -48,6 +49,7 @@ Behavior:
 Examples:
   /tmp/rsdb_import_reputation_dumps.sh --dry-run
   /tmp/rsdb_import_reputation_dumps.sh
+  /tmp/rsdb_import_reputation_dumps.sh --bootstrap --dry-run
   /tmp/rsdb_import_reputation_dumps.sh --type week
   /tmp/rsdb_import_reputation_dumps.sh --on-coverage-gap import-prefix
 USAGE
@@ -57,6 +59,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)
       MODE="dry-run"
+      shift
+      ;;
+    --bootstrap)
+      BOOTSTRAP_REQUESTED=1
       shift
       ;;
     --type)
@@ -476,6 +482,11 @@ validate_bootstrap_preconditions() {
 
   (( INITIAL_CURSOR_AVAILABLE == 0 )) || return 0
 
+  if (( BOOTSTRAP_REQUESTED == 0 )); then
+    echo "RSDB has no parseable metadata cursor. Abort without importing: do not infer that the database is empty from an unreadable metadata query. If this is a verified new or cleared RSDB, retry with --bootstrap and exactly one complete full dump bundle." >&2
+    return 1
+  fi
+
   # A state row without current DB metadata cannot prove that the database is
   # still populated. Do not let it make a fresh or unreadable RSDB look ready.
   if state_has_records; then
@@ -604,8 +615,10 @@ print_no_package_download_guidance() {
     log "Cannot create a safe incremental download plan because RSDB has no parseable metadata cursor."
     if state_has_records; then
       log "Import-state records exist, but they are not a substitute for current DB metadata. Resolve the metadata read first."
+    elif (( BOOTSTRAP_REQUESTED == 1 )); then
+      log "Bootstrap was requested. Download exactly one complete current full dump bundle first, then run --bootstrap --dry-run after placing it in $SRC_DIR."
     else
-      log "For a new or empty RSDB, download exactly one complete current full dump bundle first. After placing it in $SRC_DIR, run --dry-run; the importer will validate the later week/day chain from that full dump date."
+      log "For a verified new or empty RSDB, download exactly one complete current full dump bundle first. Then run --bootstrap --dry-run; without --bootstrap the importer will not infer that an unreadable RSDB is empty."
     fi
     return 0
   fi
@@ -972,7 +985,7 @@ main() {
     INITIAL_CURSOR_AVAILABLE=1
   else
     INITIAL_CURSOR_AVAILABLE=0
-    log "No initial DB metadata cursor is available. An existing RSDB must restore metadata access; a new RSDB must provide exactly one complete full dump bundle."
+    log "No initial DB metadata cursor is available. An existing RSDB must restore metadata access; a verified new RSDB must use --bootstrap with exactly one complete full dump bundle."
   fi
   ensure_workdir
   check_filesystem_space

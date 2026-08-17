@@ -51,8 +51,8 @@ This project provides a guarded shell-based workflow for importing FortiEDR Repu
   ```
 
 - For a new or empty RSDB, place exactly one complete full-dump date in `/tmp`
-  before adding incremental packages. Do not mix historical full snapshots into
-  the bootstrap directory.
+  before adding incremental packages. Use `--bootstrap` explicitly for the
+  first initialization; do not mix historical full snapshots into that directory.
 
 - The script uses `/tmp/rsdb_ramwork` as a `tmpfs` working directory. It
   mounts it automatically when needed and requires enough RAM-backed space for
@@ -96,6 +96,13 @@ flowchart LR
    /tmp/rsdb_import_reputation_dumps.sh 2>&1 | tee "/var/log/reputationdb/import_runner/import_$(date '+%Y%m%d_%H%M%S').log"
    ```
 
+For a verified new or cleared RSDB, use the explicit bootstrap mode:
+
+```bash
+/tmp/rsdb_import_reputation_dumps.sh --bootstrap --dry-run
+/tmp/rsdb_import_reputation_dumps.sh --bootstrap
+```
+
 > [!TIP]
 > Do not call `reputationdb load-dump` directly for normal operations. The importer adds ordering, coverage, logging, and state safeguards that the raw CLI does not provide.
 
@@ -110,8 +117,9 @@ flowchart LR
 - Imports parts of the same package in ascending part number order.
 - Refuses incomplete part sequences unless the missing part is already known
   to be handled.
-- When RSDB has no readable metadata cursor, requires exactly one full-dump
-  date and an empty importer state file. It never treats state records alone
+- When RSDB has no readable metadata cursor, stops by default. It permits a
+  first initialization only with explicit `--bootstrap`, exactly one full-dump
+  date, and an empty importer state file. It never treats state records alone
   as proof that a fresh or unreadable database is ready for weekly or daily
   updates.
 - If no matching package is present, prints a download recommendation based on
@@ -193,6 +201,10 @@ from the database metadata produced by the preceding week import.
 --dry-run
     Print the plan and validation result without calling load-dump or deleting
     aged packages.
+
+--bootstrap
+    Explicitly authorize a first initialization on a verified new or cleared
+    RSDB. Requires exactly one complete full-dump date and an empty state file.
 
 --type all|full|week|day
     Restrict discovery to one package type. Use only when the required earlier
