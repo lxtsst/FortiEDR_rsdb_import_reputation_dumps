@@ -1,236 +1,192 @@
-# FortiEDR RSDB Reputation Dump 自动导入脚本使用说明
+# FortiEDR RSDB Reputation Dump 导入工具
 
 中文 | [English](README.en.md)
 
-## 简介
+本项目提供一套带防护机制的 Shell 脚本，用于在 Air-Gap 或离线部署的
+FortiEDR RSDB 服务器中导入 Reputation dump 更新包。适用于在联网环境下载
+更新包后，再上传至 RSDB 服务器 `/tmp` 目录的运维场景。
 
-该脚本用于 FortiEDR air-gapped 或离线部署场景。当 FortiEDR 环境无法直接从 Fortinet 云端获取 reputation 数据时，可以先在外部环境下载 full、week、day 级别的 reputation dump zip 文件，再上传到 RSDB 服务器的 `/tmp` 目录，由本脚本按正确顺序自动导入到 FortiEDR Reputation DB Server。
+> 本工具不是 Fortinet 官方产品组件。生产使用前，请先在测试 RSDB 上验证。
 
-脚本重点解决离线导入过程中的几个常见问题：大 full 包导入耗时长、签名校验容易受临时目录性能影响、多个 dump 包之间存在覆盖关系、重复导入会导致 metadata 校验失败，以及后续增量包需要持续、安全地导入。
+## 文件说明
 
-## 脚本位置
+| 文件 | 用途 |
+| --- | --- |
+| `rsdb_import_reputation_dumps.sh` | 常规 RSDB Reputation dump 安全导入脚本。 |
+| `rsdb_test_out_of_order_daily_imports.sh` | 仅限测试 RSDB 的辅助工具，用于记录产品对缺包、回补和重复日日包的直接处理行为。 |
+| `tests/coverage_logic_test.sh` | 导入计划与覆盖逻辑的本地回归测试。 |
 
-RSDB 服务器上的脚本路径：
+## 运行要求
 
-```bash
-/tmp/rsdb_import_reputation_dumps.sh
-```
+- 必须以 `root` 用户在 RSDB 服务器上运行。
+- 已安装且可正常调用 `reputationdb` CLI。
+- 系统需要具备 `bash`、`find`、`sort`、`stat`、`flock`、`mount`、`findmnt`
+  和 `df` 等标准 Linux 工具。
+- 更新包必须直接放在 `/tmp` 中，并保持原始文件名格式：
 
-该脚本用于自动导入 `/tmp` 目录下的 FortiEDR Reputation dump zip 文件。
+  ```text
+  reputation-full-YYYY-MM-DD-part_part_N.zip
+  reputation-week-YYYY-MM-DD-part_part_N.zip
+  reputation-day-YYYY-MM-DD-part_part_N.zip
+  ```
 
-## 脚本功能
+- 脚本使用 `/tmp/rsdb_ramwork` 作为 `tmpfs` 工作目录；需要时会自动挂载，且
+  要求存在足以容纳当前包大小加 1 GiB 的内存工作空间。
 
-- 自动发现 `/tmp` 下的以下文件：
-  - `reputation-full-*-part_part_*.zip`
-  - `reputation-week-*-part_part_*.zip`
-  - `reputation-day-*-part_part_*.zip`
-- 自动按顺序导入：`full` -> `week` -> `day`。
-- 同类型文件按日期和 part 编号排序导入。
-- 使用 `/tmp/rsdb_ramwork` 作为 `tmpfs` 内存工作目录，避免大 full 包签名校验超时。
-- 防止重复导入，判断依据包括：
-  - `/var/lib/reputationdb/import_state/imported_dumps.tsv` 中相同文件名和文件大小的记录
-  - `reputationdb last-dump-metadata`
-- 根据最新 DB metadata 判断覆盖关系，例如已导入的 week 包会跳过其时间范围内的 day 包。metadata 游标日期之后的 full、week、day 包不会仅因包类型而被跳过。
-- 如果 `reputationdb` 返回 `dump data was already loaded`，脚本会按已加载处理并继续后续文件。
-- 成功导入后记录文件名、大小、路径和时间；不再对多 GB dump 文件计算 sha256。
-- 自动清理 `/tmp` 下超过 15 天且已确认导入成功的 dump zip 文件。
-- 如果已有 `reputationdb load-dump` 进程在运行，脚本会退出，避免并发导入。
+## 快速开始
 
-## 重要注意事项
-
-- 必须使用 `root` 用户运行。
-- 不要在已有导入任务运行时再次启动脚本。
-- 如果 RocksDB 被重建、清空或从备份恢复，需要检查或清理状态文件：
+将主脚本上传到 RSDB 服务器后，必须先执行 dry-run：
 
 ```bash
-/var/lib/reputationdb/import_state/imported_dumps.tsv
-```
-
-否则脚本可能会根据旧状态跳过某些文件，但这些数据实际已经不在 RocksDB 中。
-
-历史 CLI 日志仅用于故障诊断，不作为当前 DB 已加载的判断依据。这样在 RocksDB 重建或回滚后，旧日志不会造成错误跳包。
-
-脚本运行时可能提示 `reputationDBServer --server` 正在运行。这个服务是 RSDB 常驻服务，通常可以继续导入。只有在导入失败并出现 RocksDB `LOCK` 错误时，才考虑停止服务后重试。
-
-## 推荐使用流程
-
-1. 将 dump zip 文件上传到 RSDB 的 `/tmp` 目录。
-
-2. 确认当前没有导入任务正在运行：
-
-```bash
-ps -eo pid,etime,pcpu,pmem,args | grep "reputationdb load-dump" | grep -v grep || true
-```
-
-3. 先使用 dry-run 查看导入计划：
-
-```bash
+chmod 700 /tmp/rsdb_import_reputation_dumps.sh
 /tmp/rsdb_import_reputation_dumps.sh --dry-run
 ```
 
-重点检查：
-
-- full、week、day 的导入顺序是否正确；
-- 已导入的文件是否显示为 `SKIP`；
-- 仅确实被最新 metadata 时间范围覆盖的文件是否显示为 `SKIP`；
-- 待导入的新文件是否显示为 `IMPORT`；
-- 是否有旧文件清理提示；
-- 是否有空间不足或 part 缺失提示。
-
-4. 确认计划无误后正式执行：
+确认计划正确后，执行正式导入：
 
 ```bash
 /tmp/rsdb_import_reputation_dumps.sh
 ```
 
-也可以只导入某一种类型：
+如需在单包日志之外保留一份完整终端日志：
 
 ```bash
-/tmp/rsdb_import_reputation_dumps.sh --type full
-/tmp/rsdb_import_reputation_dumps.sh --type week
-/tmp/rsdb_import_reputation_dumps.sh --type day
+set -o pipefail
+/tmp/rsdb_import_reputation_dumps.sh 2>&1 | tee "/var/log/reputationdb/import_runner/import_$(date '+%Y%m%d_%H%M%S').log"
 ```
 
-## 运行状态检查
+常规更新不要直接调用 `reputationdb load-dump`。主脚本提供了原厂 CLI 本身
+没有的排序、覆盖判断、日志和状态保护。
 
-查看当前是否有导入进程：
+## 脚本功能
+
+### 更新包发现与排序
+
+- 自动发现 `/tmp` 中匹配的 full、week 和 day 更新包。
+- full 包始终优先处理。
+- 其后的 week 与 day 包按日期排序；同一天时，week 包先于 day 包。
+- 同一更新包的多个 part 按 part 编号递增导入。
+- 如果某个必需 part 缺失且未被确认处理，脚本会停止。
+
+### 重复包与覆盖判断
+
+- 通过 `/var/lib/reputationdb/import_state/imported_dumps.tsv` 中匹配的文件名和
+  文件大小跳过已处理包。
+- 在生成计划前、以及每个包成功导入后，读取
+  `reputationdb last-dump-metadata`。
+- 以周包实际返回的 metadata `from/to` 范围为依据，跳过其覆盖的日包；此类
+  跳过会写入 `metadata_coverage` 状态，避免未来游标继续推进后再次加载该文件。
+- 不会仅因 metadata 日期更新就把所有更早文件视为已导入。
+- 同名但大小不同的文件仍会作为新候选包交给产品校验。
+
+### 连续更新链保护
+
+在导入前，脚本从当前 RSDB metadata 游标开始验证增量更新链是否连续。它会检测：
+
+- 下一个 week 或 day 包之前存在缺失时间段；
+- 回补包早于当前已达到的游标；
+- 某个更新包缺少 part。
+
+预检查停止时，不会调用导入命令，也不会删除过期包。
+
+正常交互运行遇到缺口时，可选择只导入缺口前已验证连续的前缀，或退出后补齐更新包。
+也可以显式指定策略：
 
 ```bash
-ps -eo pid,etime,pcpu,pmem,args | grep "reputationdb load-dump" | grep -v grep || true
+# 发现缺口后直接停止。
+/tmp/rsdb_import_reputation_dumps.sh --on-coverage-gap abort
+
+# 仅导入第一个缺口之前已验证连续的包。
+/tmp/rsdb_import_reputation_dumps.sh --on-coverage-gap import-prefix
+
+# 仅预览安全前缀，不执行导入。
+/tmp/rsdb_import_reputation_dumps.sh --dry-run --on-coverage-gap import-prefix
 ```
 
-查看 Reputation DB CLI 详细日志：
+### 计划状态说明
 
-```bash
-tail -f /var/log/reputationdb/cli/reputationdb.log
+| 状态 | 含义 |
+| --- | --- |
+| `SKIP` | 文件已由匹配的状态记录或当前已验证的 metadata 覆盖范围处理。 |
+| `IMPORT` | 文件满足条件，可以调用 `reputationdb load-dump`。 |
+| `CHECK` | 同日期的 week 包会先执行，day 包需等待 RSDB 返回该周包的实际 metadata 范围后再决定是否跳过。 |
+
+`CHECK` 不代表必然跳过，也不代表必然导入；最终以紧邻周包导入后 RSDB 返回的
+实际 metadata 为准。
+
+### 资源、并发与清理保护
+
+- 检测到已有 `reputationdb load-dump` 进程时拒绝启动。
+- 使用锁文件防止多个主脚本实例并发运行。
+- 在导入前检查根分区、RocksDB 文件系统和 `tmpfs` 工作目录空间。
+- 每个原厂导入命令均生成独立日志文件。
+- 所有计划项处理完成后，仅删除超过 15 天且已确认处理的更新包；dry-run 只展示
+  可能清理的文件，不会删除。
+- 在安全条件下清理工作目录中的临时 `data_reputation-*` 文件。
+
+## 参数
+
+```text
+--dry-run
+    仅输出计划和检查结果；不调用 load-dump，也不删除过期更新包。
+
+--type all|full|week|day
+    仅发现指定类型的更新包。仅当所需的前置更新链已经存在于 RSDB 时使用。
+
+--on-coverage-gap abort|prompt|import-prefix
+    指定发现增量覆盖缺口时的行为。交互式正式运行默认使用 prompt。
 ```
 
-查看脚本为每个文件生成的独立日志：
+## 日志与状态文件
+
+| 路径 | 内容 |
+| --- | --- |
+| `/var/log/reputationdb/import_runner/` | 每个更新包的原厂命令输出，以及可选的 `tee` 汇总日志。 |
+| `/var/lib/reputationdb/import_state/imported_dumps.tsv` | 成功导入包和被 metadata 覆盖日包的文件名、大小状态记录。 |
+| `/tmp/rsdb_ramwork/` | 导入过程使用的内存工作目录。 |
+
+常用检查命令：
 
 ```bash
-ls -lh /var/log/reputationdb/import_runner/
+ps -eo pid,etime,pcpu,pmem,args | grep 'reputationdb load-dump' | grep -v grep || true
 tail -f /var/log/reputationdb/import_runner/*.log
+reputationdb last-dump-metadata
 ```
 
-查看内存工作目录空间和临时文件：
+脚本要求原厂命令具有成功结果，并在单包输出中包含成功标记；同时会识别
+`db is missing update to use this dump`，停止导入并给出补包建议。
+
+如果 RocksDB 被重建、清空、回滚或从备份恢复，应先检查并通常清理
+`imported_dumps.tsv`。状态记录只对创建它的同一个数据库实例有效。
+
+## 仅测试 RSDB 使用的直接 CLI 工具
+
+`rsdb_test_out_of_order_daily_imports.sh` 仅用于可丢弃的测试 RSDB。它会为直接
+导入的日包序列创建证据包，并记录产品对重复包的接受或拒绝行为；不会修改常规
+导入脚本的状态文件。
+
+默认只做预检查：
 
 ```bash
-df -h /tmp/rsdb_ramwork
-ls -lh /tmp/rsdb_ramwork
+/tmp/rsdb_test_out_of_order_daily_imports.sh \
+  --first 2026-08-12 --second 2026-08-14 --backfill 2026-08-13
 ```
 
-查看 RocksDB 数据目录大小和磁盘空间：
+只有在明确允许修改测试数据库时才加 `--run`。不要在生产 RSDB 上使用，也不要
+与常规导入脚本并发运行。
 
-```bash
-du -sh /var/lib/reputationdb/rocksdb_data
-df -h /var/lib/reputationdb/rocksdb_data /
-```
+## 本地回归检查
 
-## 成功日志判断
-
-成功导入时，`/var/log/reputationdb/cli/reputationdb.log` 中通常会出现：
-
-```text
-Metadata saved
-Load dump successfully
-```
-
-导入过程中，常见的正常进度日志包括：
-
-```text
-LoadFile: Loading reputation file ...
-Loaded 10000 hashes to save
-Saving batch, Batch size: 10000
-```
-
-看到这些日志说明已经进入实际写库阶段。
-
-## 常见失败情况
-
-如果签名验证超时，日志可能出现：
-
-```text
-Signature verification failed: verification timed out after 5 minutes
-```
-
-脚本会输出明确失败提示，并清理 `/tmp/rsdb_ramwork` 中的临时 `data_reputation-*` 文件。清理后可以重新运行脚本重试。
-
-如果已有导入任务正在运行，脚本会直接退出，不会启动第二个导入任务。
-
-如果 `/tmp/rsdb_ramwork` 空间不足，脚本会在导入前退出，并显示当前可用空间和需要的空间。
-
-如果根分区或 RocksDB 所在文件系统剩余空间不足，脚本也会提前退出。
-
-如果导入 day 包时日志出现：
-
-```text
-Failed to validate metadata: dump data was already loaded
-```
-
-通常表示该 day 包已经被之前导入的 week 包或其他增量包覆盖。脚本会将这种情况视为已加载并继续执行，不会中断后续导入。
-
-## 自动清理逻辑
-
-每次脚本运行时会检查 `/tmp` 下超过 15 天的 dump zip 文件。
-
-只会删除满足以下条件的文件：
-
-- 文件名匹配 reputation dump 格式；
-- 文件修改时间超过 15 天；
-- 已确认成功导入过。
-
-未确认导入成功的旧文件不会删除，脚本会输出类似：
-
-```text
-KEEP old dump not confirmed imported
-```
-
-dry-run 模式下不会真正删除文件，只会显示：
-
-```text
-DRY-RUN would delete old imported dump
-```
-
-## 状态文件说明
-
-脚本会记录成功导入过的文件：
-
-```bash
-/var/lib/reputationdb/import_state/imported_dumps.tsv
-```
-
-记录内容包括：
-
-- 导入时间；
-- 文件名；
-- 文件大小；
-- 状态标记，当前为 `name_size_only`；
-- 文件路径。
-
-对当前仍存在的文件，只有文件名和文件大小都匹配时才会被状态文件判定为已导入；同名但大小不同的文件会继续走导入和产品 metadata 校验。
-
-一般情况下不要手动修改该文件。只有在 RocksDB 重建、清空、回滚或从备份恢复后，才需要检查或清理它。
-
-## 脚本校验
-
-当前脚本 SHA256：
-
-```text
-77aa665e1ba639927def15ab853bb11f1a80a00baa109c14e5410ab7d34d8f6b
-```
-
-在 RSDB 服务器上可以用以下命令校验：
-
-```bash
-sha256sum /tmp/rsdb_import_reputation_dumps.sh
-```
-
-## 仓库回归测试
-
-在修改或发布脚本前，运行以下检查：
+修改或发布脚本前运行：
 
 ```bash
 bash tests/coverage_logic_test.sh
 ```
 
-该测试确保较旧的 day metadata 不会错误跳过日期更新的 week 或 full 包，同名不同大小的状态记录不会跳过当前文件，历史 CLI 成功日志也不会覆盖当前状态或 metadata。
+该测试覆盖排序、metadata 覆盖边界、覆盖状态持久化、缺包检测、安全前缀选择和
+产品错误分类。
+
+## 许可证
+
+本项目使用 [MIT License](LICENSE) 发布。你可以在许可证允许的范围内使用、修改和
+再分发；使用前请自行验证与 FortiEDR 版本及运维规范的兼容性。

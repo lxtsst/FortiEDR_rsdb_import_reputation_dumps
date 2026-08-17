@@ -1,239 +1,212 @@
-# FortiEDR RSDB Reputation Dump Auto Import Script
+# FortiEDR RSDB Reputation Dump Importer
 
 [中文](README.md) | English
 
-## Overview
+This project provides a guarded shell-based workflow for importing FortiEDR
+Reputation DB dump packages into an air-gapped or offline RSDB server. It is
+designed for operators who download reputation packages from a connected
+environment and place them in `/tmp` on the RSDB server.
 
-This script is intended for FortiEDR air-gapped or offline deployments. When a FortiEDR environment cannot retrieve reputation data directly from the Fortinet cloud, operators can download full, week, and day reputation dump zip files in an external environment, upload them to `/tmp` on the RSDB server, and use this script to import them into FortiEDR Reputation DB Server in the correct order.
+> This is an operational helper, not an official Fortinet product component.
+> Validate it on a test RSDB before using it in production.
 
-It addresses common operational issues in offline RSDB imports: large full dumps take a long time to process, signature verification can be sensitive to temporary directory performance, dump files can overlap in coverage, repeated imports can fail metadata validation, and later incremental week/day packages need to be imported safely without reloading already-covered data.
+## Included Files
 
-## Script Location
+| File | Purpose |
+| --- | --- |
+| `rsdb_import_reputation_dumps.sh` | Normal guarded importer for RSDB reputation dump packages. |
+| `rsdb_test_out_of_order_daily_imports.sh` | Optional test-RSDB utility for recording direct product behavior for gaps, backfills, and repeated daily packages. |
+| `tests/coverage_logic_test.sh` | Local regression test for importer planning and coverage logic. |
 
-On the RSDB server:
+## Requirements
 
-```bash
-/tmp/rsdb_import_reputation_dumps.sh
-```
+- Run as `root` on the RSDB server.
+- The `reputationdb` CLI must be installed and usable.
+- Standard Linux tools are required: `bash`, `find`, `sort`, `stat`, `flock`,
+  `mount`, `findmnt`, and `df`.
+- Dump packages must be stored directly in `/tmp` and retain the published
+  filename format:
 
-This script automatically imports FortiEDR Reputation dump zip files from `/tmp`.
+  ```text
+  reputation-full-YYYY-MM-DD-part_part_N.zip
+  reputation-week-YYYY-MM-DD-part_part_N.zip
+  reputation-day-YYYY-MM-DD-part_part_N.zip
+  ```
 
-## What the Script Does
+- The script uses `/tmp/rsdb_ramwork` as a `tmpfs` working directory. It
+  mounts it automatically when needed and requires enough RAM-backed space for
+  the active package plus 1 GiB.
 
-- Discovers the following files under `/tmp`:
-  - `reputation-full-*-part_part_*.zip`
-  - `reputation-week-*-part_part_*.zip`
-  - `reputation-day-*-part_part_*.zip`
-- Imports dumps in this order: `full` -> `week` -> `day`.
-- Sorts files of the same type by date and part number.
-- Uses `/tmp/rsdb_ramwork` as a `tmpfs` RAM work directory to reduce the risk of signature verification timeout for large full dump parts.
-- Avoids duplicate imports using:
-  - a matching filename and file size in `/var/lib/reputationdb/import_state/imported_dumps.tsv`
-  - `reputationdb last-dump-metadata`
-- Uses the latest DB metadata to skip files actually covered by a newer dump, for example day dumps covered by an imported week dump. Full, week, and day packages dated after the metadata cursor are never skipped solely because of their type.
-- Treats `dump data was already loaded` from `reputationdb` as an already-loaded condition and continues with the next file.
-- Records successful imports with filename, size, path, and timestamp; it no longer calculates sha256 for multi-GB dump files.
-- Automatically removes imported dump zip files in `/tmp` when they are older than 15 days.
-- Exits if another `reputationdb load-dump` process is already running.
+## Quick Start
 
-## Important Notes
-
-- Run the script as `root`.
-- Do not start the script while another import task is running.
-- If RocksDB is rebuilt, cleared, rolled back, or restored from backup, review or clear the state file:
-
-```bash
-/var/lib/reputationdb/import_state/imported_dumps.tsv
-```
-
-Otherwise, the script may skip files recorded in the old state file even though the data is no longer present in RocksDB.
-
-Historical CLI logs are diagnostic evidence only; they are not used as proof that the current database loaded a package. This prevents old logs from skipping packages after a RocksDB rebuild or rollback.
-
-The script may print a notice that `reputationDBServer --server` is running. This is the resident RSDB service and imports can usually continue. If an import fails with a RocksDB `LOCK` error, consider stopping the service before retrying.
-
-## Recommended Workflow
-
-1. Upload dump zip files to `/tmp` on the RSDB server.
-
-2. Confirm that no import task is currently running:
+Copy the main script to the RSDB server, then run a dry-run before any import:
 
 ```bash
-ps -eo pid,etime,pcpu,pmem,args | grep "reputationdb load-dump" | grep -v grep || true
-```
-
-3. Preview the import plan with dry-run:
-
-```bash
+chmod 700 /tmp/rsdb_import_reputation_dumps.sh
 /tmp/rsdb_import_reputation_dumps.sh --dry-run
 ```
 
-Check the output for:
-
-- whether the `full`, `week`, and `day` order is correct;
-- whether already imported files are shown as `SKIP`;
-- whether only files actually covered by the latest metadata time range are shown as `SKIP`;
-- whether new files to import are shown as `IMPORT`;
-- whether old-file cleanup messages are expected;
-- whether there are disk space or missing part warnings.
-
-4. If the plan is correct, run the import:
+When the plan is correct, run the normal importer:
 
 ```bash
 /tmp/rsdb_import_reputation_dumps.sh
 ```
 
-You can also import only one dump type:
+To preserve one combined terminal log in addition to the per-package logs:
 
 ```bash
-/tmp/rsdb_import_reputation_dumps.sh --type full
-/tmp/rsdb_import_reputation_dumps.sh --type week
-/tmp/rsdb_import_reputation_dumps.sh --type day
+set -o pipefail
+/tmp/rsdb_import_reputation_dumps.sh 2>&1 | tee "/var/log/reputationdb/import_runner/import_$(date '+%Y%m%d_%H%M%S').log"
 ```
 
-## Runtime Status Checks
+Do not call `reputationdb load-dump` directly for normal operations. The
+importer adds ordering, coverage, logging, and state safeguards that the raw
+CLI does not provide.
 
-Check whether an import process is running:
+## Import Behavior
+
+### Package discovery and order
+
+- Discovers matching full, week, and day packages in `/tmp`.
+- Imports full packages first.
+- Sorts later week and day packages chronologically; week packages are placed
+  before day packages with the same date.
+- Imports parts of the same package in ascending part number order.
+- Refuses incomplete part sequences unless the missing part is already known
+  to be handled.
+
+### Duplicate and coverage handling
+
+- Skips a package already recorded with the same filename and size in
+  `/var/lib/reputationdb/import_state/imported_dumps.tsv`.
+- Reads `reputationdb last-dump-metadata` before planning and after each
+  successful package import.
+- Uses an actual weekly metadata `from/to` range to skip covered daily
+  packages. Such skips are saved as `metadata_coverage` state records so a
+  later run does not reload the same file after the metadata cursor advances.
+- Does not treat a newer metadata date alone as proof that every earlier file
+  was loaded.
+- Treats a same-name package with a different size as a new candidate and lets
+  product validation decide it.
+
+### Continuous update-chain protection
+
+Before importing, the script validates that the available incremental packages
+form a usable continuation from the current RSDB metadata cursor. It detects:
+
+- a missing interval before a week or day package;
+- a late/backfill package that falls before the preceding cursor; and
+- missing package parts.
+
+No package is imported and no aged package is deleted when this preflight
+stops the run.
+
+For an interactive normal run, a detected gap offers a choice to import only
+the verified continuous prefix or exit and download the missing packages. The
+behavior can also be selected explicitly:
 
 ```bash
-ps -eo pid,etime,pcpu,pmem,args | grep "reputationdb load-dump" | grep -v grep || true
+# Stop if any coverage gap exists.
+/tmp/rsdb_import_reputation_dumps.sh --on-coverage-gap abort
+
+# Import only the verified prefix before the first gap.
+/tmp/rsdb_import_reputation_dumps.sh --on-coverage-gap import-prefix
+
+# Preview the verified prefix without importing it.
+/tmp/rsdb_import_reputation_dumps.sh --dry-run --on-coverage-gap import-prefix
 ```
 
-Follow the Reputation DB CLI log:
+### Plan statuses
 
-```bash
-tail -f /var/log/reputationdb/cli/reputationdb.log
+| Status | Meaning |
+| --- | --- |
+| `SKIP` | The file is already handled by matching state or current verified metadata. |
+| `IMPORT` | The file is eligible for `reputationdb load-dump`. |
+| `CHECK` | A same-date week package is scheduled first. The day package will be evaluated after RSDB returns the week package's actual metadata range. |
+
+`CHECK` is intentionally not a guaranteed skip or import. The decision is made
+from the database metadata produced by the preceding week import.
+
+### Resource, concurrency, and cleanup safeguards
+
+- Refuses to start while another `reputationdb load-dump` process is active.
+- Uses a lock file to prevent concurrent importer instances.
+- Checks root, RocksDB, and `tmpfs` free space before imports.
+- Captures each raw product invocation in a separate log file.
+- Removes only handled dump files older than 15 days, after the planned import
+  work completes. Dry-run reports potential cleanup without deleting files.
+- Removes temporary `data_reputation-*` working files when safe to do so.
+
+## Options
+
+```text
+--dry-run
+    Print the plan and validation result without calling load-dump or deleting
+    aged packages.
+
+--type all|full|week|day
+    Restrict discovery to one package type. Use only when the required earlier
+    chain is already present in RSDB.
+
+--on-coverage-gap abort|prompt|import-prefix
+    Select the response to a detected incremental coverage gap. The default is
+    prompt for an interactive normal run.
 ```
 
-View per-file logs generated by the script:
+## Logs and State
+
+| Location | Contents |
+| --- | --- |
+| `/var/log/reputationdb/import_runner/` | Per-package command output and optional combined `tee` logs. |
+| `/var/lib/reputationdb/import_state/imported_dumps.tsv` | Filename-and-size state records for successful imports and metadata-covered daily packages. |
+| `/tmp/rsdb_ramwork/` | Temporary RAM-backed working data during an active import. |
+
+Useful status commands:
 
 ```bash
-ls -lh /var/log/reputationdb/import_runner/
+ps -eo pid,etime,pcpu,pmem,args | grep 'reputationdb load-dump' | grep -v grep || true
 tail -f /var/log/reputationdb/import_runner/*.log
+reputationdb last-dump-metadata
 ```
 
-Check RAM work directory space and temporary files:
+The importer requires both a successful command result and the product success
+marker in its per-package output. It also identifies the product message
+`db is missing update to use this dump` and stops with recovery guidance.
+
+If RocksDB is rebuilt, cleared, rolled back, or restored from backup, review
+and normally clear `imported_dumps.tsv` before using the importer again. A
+state record is valid only for the database instance that created it.
+
+## Test-Only Direct-CLI Utility
+
+`rsdb_test_out_of_order_daily_imports.sh` is for a disposable test RSDB only.
+It creates an evidence bundle for a direct daily-package sequence and records
+whether the product accepts or rejects a repeated package. It never updates
+the normal importer's state file.
+
+Its default mode is preflight only:
 
 ```bash
-df -h /tmp/rsdb_ramwork
-ls -lh /tmp/rsdb_ramwork
+/tmp/rsdb_test_out_of_order_daily_imports.sh \
+  --first 2026-08-12 --second 2026-08-14 --backfill 2026-08-13
 ```
 
-Check RocksDB data size and disk space:
+Use `--run` only after explicitly accepting writes to the test database. Do
+not use this utility on production RSDB or while the normal importer runs.
 
-```bash
-du -sh /var/lib/reputationdb/rocksdb_data
-df -h /var/lib/reputationdb/rocksdb_data /
-```
+## Local Regression Check
 
-## Success Indicators
-
-Successful imports usually include the following lines in `/var/log/reputationdb/cli/reputationdb.log`:
-
-```text
-Metadata saved
-Load dump successfully
-```
-
-During an active import, normal progress logs include:
-
-```text
-LoadFile: Loading reputation file ...
-Loaded 10000 hashes to save
-Saving batch, Batch size: 10000
-```
-
-These messages indicate that the import has entered the actual RocksDB write phase.
-
-## Common Failures
-
-If signature verification times out, the log may show:
-
-```text
-Signature verification failed: verification timed out after 5 minutes
-```
-
-The script prints a clear failure message and cleans temporary `data_reputation-*` files in `/tmp/rsdb_ramwork`. After cleanup, rerunning the script may succeed.
-
-If another import task is already running, the script exits and does not start a second import task.
-
-If `/tmp/rsdb_ramwork` does not have enough free space, the script exits before importing and prints both available and required space.
-
-If the root filesystem or the filesystem containing RocksDB has insufficient free space, the script also exits early.
-
-If a day dump fails metadata validation with:
-
-```text
-Failed to validate metadata: dump data was already loaded
-```
-
-it usually means that the day dump was already covered by a previously imported week dump or another incremental dump. The script treats this as already loaded and continues instead of stopping the run.
-
-## Automatic Cleanup
-
-Each run checks dump zip files in `/tmp` that are older than 15 days.
-
-The script deletes a file only when all of the following are true:
-
-- the filename matches the reputation dump format;
-- the file modification time is older than 15 days;
-- the file is confirmed to have been imported successfully.
-
-Old files that are not confirmed as imported are kept. The script prints:
-
-```text
-KEEP old dump not confirmed imported
-```
-
-In dry-run mode, files are not deleted. The script only prints:
-
-```text
-DRY-RUN would delete old imported dump
-```
-
-## State File
-
-The script records successfully imported files in:
-
-```bash
-/var/lib/reputationdb/import_state/imported_dumps.tsv
-```
-
-Each record includes:
-
-- import time;
-- filename;
-- file size;
-- state marker, currently `name_size_only`;
-- file path.
-
-For a file that is still present, the state file marks it as imported only when both its filename and size match. A same-name file with a different size continues through the import and product metadata checks.
-
-Do not manually edit this file during normal operation. Review or clear it only after RocksDB is rebuilt, cleared, rolled back, or restored from backup.
-
-## Script Verification
-
-Current script SHA256:
-
-```text
-77aa665e1ba639927def15ab853bb11f1a80a00baa109c14e5410ab7d34d8f6b
-```
-
-Verify it on the RSDB server:
-
-```bash
-sha256sum /tmp/rsdb_import_reputation_dumps.sh
-```
-
-## Repository Regression Check
-
-Run this check before changing or publishing the script:
+Run before changing or publishing the scripts:
 
 ```bash
 bash tests/coverage_logic_test.sh
 ```
 
-The check ensures that stale day metadata cannot skip a later week or full
-package, same-name state records with a different size cannot skip the current
-file, and historical CLI success markers cannot override current state or
-metadata.
+The test covers ordering, metadata coverage boundaries, persisted coverage
+state, gap detection, safe-prefix selection, and product-error classification.
+
+## License
+
+This project is released under the [MIT License](LICENSE). You may use,
+modify, and redistribute it under that license. Validate compatibility with
+your FortiEDR version and operational policy before use.

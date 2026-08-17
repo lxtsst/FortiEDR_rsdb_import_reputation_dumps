@@ -15,22 +15,27 @@ MIN_ROOT_AVAIL_BYTES=$((10 * ONE_GIB))
 MIN_DB_AVAIL_BYTES=$((20 * ONE_GIB))
 MODE="run"
 ONLY_TYPE="all"
+COVERAGE_GAP_ACTION="prompt"
 LATEST_META_RANK=""
 LATEST_META_DATE=""
 LATEST_META_FROM_DATE=""
 LATEST_META_PART=""
 LATEST_META_TYPE=""
+COVERAGE_GAP_TYPE=""
+COVERAGE_GAP_DATE=""
 
 usage() {
   cat <<'USAGE'
 Usage:
-  /tmp/rsdb_import_reputation_dumps.sh [--dry-run] [--type all|full|week|day]
+  /tmp/rsdb_import_reputation_dumps.sh [--dry-run] [--type all|full|week|day] [--on-coverage-gap abort|prompt|import-prefix]
 
 Behavior:
   - Discovers reputation dump zip files in /tmp.
-  - Imports in order: full, then week, then day.
+  - Imports full first, then interleaves week/day packages by date.
   - Skips files already recorded in state with the same name and size, or
     covered by current reputationdb metadata.
+  - Detects missing incremental coverage before import. In an interactive run,
+    prompts to import only the verified continuous prefix or to exit.
   - Uses /tmp/rsdb_ramwork tmpfs as the working directory for large full parts.
   - Records successful imports in /var/lib/reputationdb/import_state/imported_dumps.tsv.
   - New records use file name and size only to avoid hashing multi-GB dump files.
@@ -43,6 +48,7 @@ Examples:
   /tmp/rsdb_import_reputation_dumps.sh --dry-run
   /tmp/rsdb_import_reputation_dumps.sh
   /tmp/rsdb_import_reputation_dumps.sh --type week
+  /tmp/rsdb_import_reputation_dumps.sh --on-coverage-gap import-prefix
 USAGE
 }
 
@@ -57,6 +63,14 @@ while [[ $# -gt 0 ]]; do
       case "$ONLY_TYPE" in
         all|full|week|day) ;;
         *) echo "Invalid --type: $ONLY_TYPE" >&2; exit 2 ;;
+      esac
+      shift 2
+      ;;
+    --on-coverage-gap)
+      COVERAGE_GAP_ACTION="${2:-}"
+      case "$COVERAGE_GAP_ACTION" in
+        abort|prompt|import-prefix) ;;
+        *) echo "Invalid --on-coverage-gap: $COVERAGE_GAP_ACTION" >&2; exit 2 ;;
       esac
       shift 2
       ;;
@@ -94,33 +108,52 @@ parse_dump_basename() {
   return 1
 }
 
-load_latest_metadata_cursor() {
-  local out type date part from_date
+clear_latest_metadata_cursor() {
+  LATEST_META_RANK=""
+  LATEST_META_DATE=""
+  LATEST_META_FROM_DATE=""
+  LATEST_META_PART=""
+  LATEST_META_TYPE=""
+}
 
-  # last-dump-metadata can hit a RocksDB LOCK when invoked from /tmp or through
-  # some pipelines on this RSDB build. Keep metadata reads out of the dump
-  # working directory and avoid piping reputationdb directly.
-  out="$(cd / && reputationdb last-dump-metadata 2>&1 || true)"
+set_latest_metadata_cursor_from_output() {
+  local out="$1"
+  local type date part from_date
+
+  clear_latest_metadata_cursor
   out="${out//$'\n'/ }"
   from_date=""
   if [[ "$out" =~ from:[[:space:]]*([0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2} ]]; then
     from_date="${BASH_REMATCH[1]}"
   fi
-  if [[ "$out" =~ type:[[:space:]]*(full|week|day)[[:space:]]+from:.*to:([0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+partNum:[[:space:]]*([0-9]+) ]]; then
-    type="${BASH_REMATCH[1]}"
-    date="${BASH_REMATCH[2]}"
-    part="${BASH_REMATCH[3]}"
-    LATEST_META_TYPE="$type"
-    LATEST_META_DATE="$date"
-    LATEST_META_FROM_DATE="$from_date"
-    LATEST_META_PART="$part"
-    LATEST_META_RANK="$(rank_for_type "$type")"
-    if [[ -n "$from_date" ]]; then
-      log "Latest DB metadata cursor: $type $from_date to $date part $part"
-    else
-      log "Latest DB metadata cursor: $type $date part $part"
-    fi
+  if [[ ! "$out" =~ type:[[:space:]]*(full|week|day)[[:space:]]+from:.*to:([0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+partNum:[[:space:]]*([0-9]+) ]]; then
+    return 1
   fi
+
+  type="${BASH_REMATCH[1]}"
+  date="${BASH_REMATCH[2]}"
+  part="${BASH_REMATCH[3]}"
+  LATEST_META_TYPE="$type"
+  LATEST_META_DATE="$date"
+  LATEST_META_FROM_DATE="$from_date"
+  LATEST_META_PART="$part"
+  LATEST_META_RANK="$(rank_for_type "$type")"
+  return 0
+}
+
+load_latest_metadata_cursor() {
+  local out
+
+  # last-dump-metadata can hit a RocksDB LOCK when invoked from /tmp or through
+  # some pipelines on this RSDB build. Keep metadata reads out of the dump
+  # working directory and avoid piping reputationdb directly.
+  out="$(cd / && reputationdb last-dump-metadata 2>&1 || true)"
+  if ! set_latest_metadata_cursor_from_output "$out"; then
+    log "WARNING: reputationdb last-dump-metadata returned no parseable cursor; metadata-based coverage skips are disabled until a later refresh succeeds."
+    return 1
+  fi
+
+  log "Latest DB metadata cursor: $LATEST_META_TYPE $LATEST_META_FROM_DATE to $LATEST_META_DATE part $LATEST_META_PART"
 }
 
 covered_by_latest_metadata() {
@@ -138,11 +171,11 @@ covered_by_latest_metadata() {
     fi
   fi
 
-  # A package dated after the current metadata cursor cannot be covered by it,
-  # regardless of whether it is a full, week, or day package. Compare dates
-  # before applying the same-date type and part tie-breakers below.
+  # A newer metadata date is not proof that every earlier package was loaded.
+  # The explicit week range above is enough to cover its interior day dumps;
+  # otherwise, only an equal-date type/part relationship is safe to skip.
   if [[ "$date" < "$LATEST_META_DATE" ]]; then
-    return 0
+    return 1
   fi
   if [[ "$date" > "$LATEST_META_DATE" ]]; then
     return 1
@@ -198,6 +231,28 @@ part_log_already_loaded() {
   grep -qi "dump data was already loaded" "$part_log"
 }
 
+part_log_missing_update() {
+  local part_log="$1"
+  grep -qi "db is missing update to use this dump" "$part_log"
+}
+
+report_missing_update() {
+  local base="$1"
+  local part_log="$2"
+  local parsed type date _part
+
+  log "FAILED incremental coverage: $base requires a closer update than the current DB metadata cursor."
+  log "Relevant reputationdb error:"
+  grep -iE "Failed to validate metadata|latestUpdateDate" "$part_log" | tail -n 5 | sed 's/^/  /' || true
+  log "Full command output log: $part_log"
+
+  parsed="$(parse_dump_basename "$base")" || return 0
+  IFS='|' read -r type date _part <<< "$parsed"
+  if [[ -n "$LATEST_META_DATE" ]]; then
+    print_recovery_advice "$LATEST_META_DATE" "$date"
+  fi
+}
+
 is_imported_path() {
   local path="$1"
   local base
@@ -215,8 +270,9 @@ is_imported_basename() {
   state_has_basename "$base" || covered_by_latest_metadata "$base"
 }
 
-record_imported() {
+record_state() {
   local path="$1"
+  local state_source="$2"
   local base size rc
   base="$(basename "$path")"
   size="$(file_size "$path")"
@@ -227,9 +283,17 @@ record_imported() {
   set -e
 
   if [[ "$rc" -ne 0 ]]; then
-    log "Recording imported dump state by file name and size: $base"
-    printf "%s\t%s\t%s\t%s\t%s\n" "$(date '+%F %T %Z')" "$base" "$size" "name_size_only" "$path" >> "$STATE_FILE"
+    log "Recording $state_source dump state by file name and size: $base"
+    printf "%s\t%s\t%s\t%s\t%s\n" "$(date '+%F %T %Z')" "$base" "$size" "$state_source" "$path" >> "$STATE_FILE"
   fi
+}
+
+record_imported() {
+  record_state "$1" "name_size_only"
+}
+
+record_covered_by_metadata() {
+  record_state "$1" "metadata_coverage"
 }
 
 expected_basename() {
@@ -354,7 +418,7 @@ check_workdir_space_for_dump() {
 }
 
 discover_files() {
-  local path base type date part rank
+  local path base type date part rank group
   find "$SRC_DIR" -maxdepth 1 -type f -name 'reputation-*-part_part_*.zip' | while IFS= read -r path; do
     base="$(basename "$path")"
     if [[ "$base" =~ ^reputation-(full|week|day)-([0-9]{4}-[0-9]{2}-[0-9]{2})-part_part_([0-9]+)\.zip$ ]]; then
@@ -365,9 +429,27 @@ discover_files() {
         continue
       fi
       rank="$(rank_for_type "$type")"
-      printf "%s|%s|%010d|%s|%s|%s\n" "$rank" "$date" "$part" "$type" "$part" "$path"
+      if [[ "$type" == "full" ]]; then
+        group=1
+      else
+        group=2
+      fi
+      printf "%s|%s|%s|%010d|%s|%s|%s\n" "$group" "$rank" "$date" "$part" "$type" "$part" "$path"
     fi
-  done | sort -t '|' -k1,1n -k2,2 -k3,3n
+  done | sort -t '|' -k1,1n -k3,3 -k2,2n -k4,4n | cut -d '|' -f2-
+}
+
+has_new_week_on_date() {
+  local plan_file="$1"
+  local target_date="$2"
+  local _rank date _part_padded type _part path
+
+  while IFS='|' read -r _rank date _part_padded type _part path; do
+    if [[ "$type" == "week" && "$date" == "$target_date" ]] && ! is_imported_path "$path"; then
+      return 0
+    fi
+  done < "$plan_file"
+  return 1
 }
 
 validate_contiguous_parts() {
@@ -407,6 +489,256 @@ validate_contiguous_parts() {
   done
 }
 
+date_to_epoch() {
+  local date_value="$1"
+
+  if date -u -d "$date_value" '+%s' >/dev/null 2>&1; then
+    date -u -d "$date_value" '+%s'
+  else
+    date -u -j -f '%Y-%m-%d' "$date_value" '+%s'
+  fi
+}
+
+date_add_days() {
+  local date_value="$1"
+  local days="$2"
+  local bsd_modifier
+
+  if date -u -d "$date_value $days days" '+%F' >/dev/null 2>&1; then
+    date -u -d "$date_value $days days" '+%F'
+  else
+    if [[ "$days" == -* ]]; then
+      bsd_modifier="$days"
+    else
+      bsd_modifier="+$days"
+    fi
+    date -u -j -v"${bsd_modifier}"d -f '%Y-%m-%d' "$date_value" '+%F'
+  fi
+}
+
+days_between() {
+  local start_date="$1"
+  local end_date="$2"
+  local start_epoch end_epoch
+
+  start_epoch="$(date_to_epoch "$start_date")"
+  end_epoch="$(date_to_epoch "$end_date")"
+  printf '%s\n' "$(((end_epoch - start_epoch) / 86400))"
+}
+
+missing_day_dates() {
+  local previous_date="$1"
+  local next_date="$2"
+  local current_date separator=""
+
+  current_date="$(date_add_days "$previous_date" 1)"
+  while [[ "$current_date" < "$next_date" ]]; do
+    printf '%s%s' "$separator" "$current_date"
+    separator=", "
+    current_date="$(date_add_days "$current_date" 1)"
+  done
+}
+
+print_missing_daily_packages() {
+  local previous_date="$1"
+  local next_date="$2"
+  local current_date total_days
+
+  total_days="$(days_between "$previous_date" "$next_date")"
+  (( total_days > 1 )) || return 0
+
+  if (( total_days > 31 )); then
+    log "Daily alternative: ${total_days} daily dates are missing, from $(date_add_days "$previous_date" 1) through $(date_add_days "$next_date" -1). Prefer the weekly recovery checkpoints below."
+    return 0
+  fi
+
+  log "Daily-package alternative (download every listed date before retrying $next_date):"
+  current_date="$(date_add_days "$previous_date" 1)"
+  while [[ "$current_date" < "$next_date" ]]; do
+    printf '  reputation-day-%s-part_part_*.zip\n' "$current_date"
+    current_date="$(date_add_days "$current_date" 1)"
+  done
+}
+
+print_weekly_recovery_packages() {
+  local previous_date="$1"
+  local next_date="$2"
+  local checkpoint
+
+  checkpoint="$(date_add_days "$previous_date" 7)"
+  [[ "$checkpoint" < "$next_date" ]] || return 0
+
+  log "Weekly-package recovery checkpoints (use the nearest available weekly package on or before each date):"
+  while [[ "$checkpoint" < "$next_date" ]]; do
+    printf '  reputation-week-%s-part_part_*.zip\n' "$checkpoint"
+    checkpoint="$(date_add_days "$checkpoint" 7)"
+  done
+}
+
+print_recovery_advice() {
+  local previous_date="$1"
+  local next_date="$2"
+  local delta
+
+  delta="$(days_between "$previous_date" "$next_date")"
+  if (( delta <= 1 )); then
+    log "No earlier date can be derived from the DB cursor; review the full command output log before retrying."
+    return 0
+  fi
+
+  log "Recovery required before retrying $next_date: current DB cursor ends at $previous_date and the target is $delta days later."
+  print_weekly_recovery_packages "$previous_date" "$next_date"
+  print_missing_daily_packages "$previous_date" "$next_date"
+}
+
+validate_incremental_coverage() {
+  local plan_file="$1"
+  local date type path delta coverage_cursor="" missing_dates
+  local has_gap=0 has_unsafe=0
+
+  COVERAGE_GAP_TYPE=""
+  COVERAGE_GAP_DATE=""
+  coverage_cursor="$LATEST_META_DATE"
+
+  while IFS='|' read -r _rank date _part_padded type _part path; do
+    if is_imported_path "$path"; then
+      continue
+    fi
+
+    if [[ -n "$coverage_cursor" && "$date" < "$coverage_cursor" ]]; then
+      echo "Unsafe late/backfill package: $(basename "$path") is older than the preceding coverage cursor $coverage_cursor and has no matching import-state record. Abort without calling reputationdb." >&2
+      has_unsafe=1
+      continue
+    fi
+
+    case "$type" in
+      full)
+        coverage_cursor="$date"
+        ;;
+      week)
+        if [[ -n "$coverage_cursor" ]]; then
+          delta="$(days_between "$coverage_cursor" "$date")"
+          if (( delta < 0 )); then
+            echo "Unsafe late weekly package: $date is before the preceding coverage cursor $coverage_cursor. Abort without calling reputationdb." >&2
+            has_unsafe=1
+            continue
+          elif (( delta > 7 )); then
+            echo "Missing incremental coverage before weekly package $date: preceding cursor is $coverage_cursor and the next weekly package is $delta days later. Abort without calling reputationdb." >&2
+            print_recovery_advice "$coverage_cursor" "$date" >&2
+            COVERAGE_GAP_TYPE="week"
+            COVERAGE_GAP_DATE="$date"
+            has_gap=1
+            break
+          fi
+        fi
+        coverage_cursor="$date"
+        ;;
+      day)
+        if [[ -n "$coverage_cursor" ]]; then
+          delta="$(days_between "$coverage_cursor" "$date")"
+          if (( delta < 0 )); then
+            echo "Unsafe late daily package: $date is before the preceding coverage cursor $coverage_cursor. Abort without calling reputationdb." >&2
+            has_unsafe=1
+            continue
+          elif (( delta > 1 )); then
+            missing_dates="$(missing_day_dates "$coverage_cursor" "$date")"
+            echo "Missing daily package date(s): $missing_dates (between $coverage_cursor and $date). Abort without calling reputationdb." >&2
+            print_missing_daily_packages "$coverage_cursor" "$date" >&2
+            COVERAGE_GAP_TYPE="day"
+            COVERAGE_GAP_DATE="$date"
+            has_gap=1
+            break
+          fi
+        fi
+        coverage_cursor="$date"
+        ;;
+    esac
+  done < "$plan_file"
+
+  if (( has_unsafe )); then
+    return 2
+  fi
+  if (( has_gap )); then
+    return 1
+  fi
+  return 0
+}
+
+build_safe_prefix_plan() {
+  local plan_file="$1"
+  local prefix_plan_file="$2"
+  local rank date stop_at_gap=0
+
+  : > "$prefix_plan_file"
+  while IFS='|' read -r rank date _part_padded _type _part _path; do
+    if [[ "$_type" == "$COVERAGE_GAP_TYPE" && "$date" == "$COVERAGE_GAP_DATE" ]]; then
+      stop_at_gap=1
+    fi
+    if (( ! stop_at_gap )) && ! is_imported_path "$_path"; then
+      printf '%s|%s|%s|%s|%s|%s\n' "$rank" "$date" "$_part_padded" "$_type" "$_part" "$_path" >> "$prefix_plan_file"
+    fi
+  done < "$plan_file"
+}
+
+resolve_incremental_coverage() {
+  local plan_file="$1"
+  local prefix_plan_file="$2"
+  local rc response prefix_count
+
+  SELECTED_PLAN_FILE="$plan_file"
+  set +e
+  validate_incremental_coverage "$plan_file"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "$rc" -eq 2 ]]; then
+    echo "Unsafe late/backfill package detected. No packages will be imported; recover a continuous chain from the current DB cursor instead." >&2
+    return 1
+  fi
+
+  build_safe_prefix_plan "$plan_file" "$prefix_plan_file"
+  prefix_count="$(wc -l < "$prefix_plan_file" | tr -d ' ')"
+  if [[ "$prefix_count" -eq 0 ]]; then
+    echo "No verified continuous package exists before the first coverage gap. No packages will be imported." >&2
+    return 1
+  fi
+
+  echo "Safe prefix available: $prefix_count package part(s) before ${COVERAGE_GAP_TYPE} ${COVERAGE_GAP_DATE}. Packages at and after that boundary will remain in $SRC_DIR for a later run." >&2
+  case "$COVERAGE_GAP_ACTION" in
+    abort)
+      echo "No packages will be imported. Download the suggested package(s) and run again." >&2
+      return 1
+      ;;
+    import-prefix)
+      log "Proceeding with the verified continuous prefix only; later packages remain pending."
+      SELECTED_PLAN_FILE="$prefix_plan_file"
+      return 0
+      ;;
+    prompt)
+      if [[ "$MODE" == "dry-run" || ! -t 0 ]]; then
+        echo "No packages will be imported. The prompt policy cannot select a prefix in dry-run or non-interactive mode; use --on-coverage-gap import-prefix to preview or run only the verified prefix." >&2
+        return 1
+      fi
+      read -r -p "Missing coverage detected. Import only the verified prefix before ${COVERAGE_GAP_TYPE} ${COVERAGE_GAP_DATE}? [p/E] " response
+      case "$response" in
+        p|P|prefix|PREFIX)
+          log "Proceeding with the verified continuous prefix only; later packages remain pending."
+          SELECTED_PLAN_FILE="$prefix_plan_file"
+          return 0
+          ;;
+        *)
+          echo "No packages will be imported. Download the suggested package(s) and run again." >&2
+          return 1
+          ;;
+      esac
+      ;;
+  esac
+}
+
 import_one() {
   local type="$1"
   local date="$2"
@@ -430,6 +762,7 @@ import_one() {
 
   if covered_by_latest_metadata "$base"; then
     log "SKIP already covered by latest DB metadata: $base"
+    record_covered_by_metadata "$path"
     return 0
   fi
 
@@ -458,6 +791,12 @@ import_one() {
       cleanup_workdir_temp
       return 0
     fi
+    if part_log_missing_update "$part_log"; then
+      report_missing_update "$base" "$part_log"
+      tail -n 80 "$part_log" || true
+      cleanup_workdir_temp
+      exit 4
+    fi
     log "FAILED import: $base exit=$rc"
     if grep -qiE "Signature verification failed|verification timed out" "$part_log"; then
       log "Signature verification failed or timed out for $base. Temporary files will be cleaned; retry may succeed."
@@ -474,6 +813,12 @@ import_one() {
       cleanup_workdir_temp
       return 0
     fi
+    if part_log_missing_update "$part_log"; then
+      report_missing_update "$base" "$part_log"
+      tail -n 80 "$part_log" || true
+      cleanup_workdir_temp
+      exit 4
+    fi
     log "FAILED verification: command exited 0 but success marker was not found for $base"
     if grep -qiE "Signature verification failed|verification timed out" "$part_log"; then
       log "Signature verification failed or timed out for $base. Temporary files will be cleaned; retry may succeed."
@@ -484,6 +829,11 @@ import_one() {
   fi
 
   record_imported "$path"
+  if load_latest_metadata_cursor; then
+    log "Refreshed DB metadata after import; remaining packages will be checked against the actual coverage range."
+  else
+    log "WARNING: imported $base, but the DB metadata cursor could not be refreshed. Remaining packages will not be skipped based on coverage until the next successful refresh."
+  fi
   log "DONE import: $base"
 }
 
@@ -500,36 +850,54 @@ main() {
 
   assert_no_load_running
   warn_reputationdb_server_running
-  load_latest_metadata_cursor
+  if ! load_latest_metadata_cursor; then
+    log "Continuing without an initial DB metadata cursor. Exact state records remain usable, but coverage-based skips require a later successful metadata refresh."
+  fi
   ensure_workdir
   check_filesystem_space
   trap cleanup_workdir_temp EXIT
-  cleanup_old_imported_dumps
 
-  local plan_file
+  local plan_file prefix_plan_file original_plan_file
   plan_file="$(mktemp /tmp/rsdb_import_plan.XXXXXX)"
+  prefix_plan_file="$(mktemp /tmp/rsdb_import_prefix.XXXXXX)"
   discover_files > "$plan_file"
 
   if [[ ! -s "$plan_file" ]]; then
     log "No matching reputation dump files found in $SRC_DIR"
     rm -f "$plan_file"
+    rm -f "$prefix_plan_file"
     exit 0
   fi
 
   validate_contiguous_parts "$plan_file"
+  if ! resolve_incremental_coverage "$plan_file" "$prefix_plan_file"; then
+    log "Incremental coverage preflight stopped the run. No dump was imported and no old dump file was deleted."
+    rm -f "$plan_file"
+    rm -f "$prefix_plan_file"
+    exit 1
+  fi
+  original_plan_file="$plan_file"
+  plan_file="$SELECTED_PLAN_FILE"
+  if [[ "$plan_file" != "$original_plan_file" ]]; then
+    rm -f "$original_plan_file"
+  fi
 
   log "Planned order:"
   while IFS='|' read -r _rank date _part_padded type part path; do
     if is_imported_path "$path"; then
       printf "  SKIP   %-4s %s part %s %s\n" "$type" "$date" "$part" "$path"
+    elif [[ "$type" == "day" ]] && has_new_week_on_date "$plan_file" "$date"; then
+      printf "  CHECK  %-4s %s part %s %s (decision deferred until the preceding week import refreshes DB metadata)\n" "$type" "$date" "$part" "$path"
     else
       printf "  IMPORT %-4s %s part %s %s\n" "$type" "$date" "$part" "$path"
     fi
   done < "$plan_file"
 
   if [[ "$MODE" == "dry-run" ]]; then
+    cleanup_old_imported_dumps
     log "Dry run only; no imports executed."
     rm -f "$plan_file"
+    rm -f "$prefix_plan_file"
     exit 0
   fi
 
@@ -543,6 +911,7 @@ main() {
   cleanup_workdir_temp
   df -h "$WORKDIR"
   rm -f "$plan_file"
+  rm -f "$prefix_plan_file"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
